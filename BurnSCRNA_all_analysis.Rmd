@@ -1,0 +1,2380 @@
+---
+title: "BurnSCRNA_all_analysis"
+author: "Yiran Hou"
+date: "2023-11-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Preparations
+```{r Load required libraries}
+library(Seurat) # from cellranger output to dimensional reduction
+library(DoubletFinder) # identity doublets
+library(harmony) # harmony integration
+library(plyr) # mapvalues for identity update
+library(dplyr)  # data arrangements 
+library(tidyr) # gather
+library(ggplot2) # general plotting
+library(scCustomize) # customized visualization for seurat objects; object merging
+library(ComplexHeatmap) # complex heatmap plotting
+library(circlize) # aesthetic touch for complex heatmap
+library(reshape2) # melt. wide-long format switch
+library(tibble) # enhanced dataframe
+library(clusterProfiler) # GSEGO, ID conversion
+library(slingshot) # pseudotime analysis
+library(monocle3) # pseudotime analysis
+library(Matrix) # writeMM to save matrix
+library(SeuratDisk) # save h5seurat and h5ad format
+library(purrr) # full join 
+library(CellChat) # CellchatDB.zebrafish database
+library(ggpubr) # statistical analysis visualization
+library(svglite) # save svg file 
+library(ggh4x) # facet nested
+library(strex) # str operations
+library(tidyverse) # as_tibble
+library(jsonlite) # JSON format operations
+library(biomaRt) # use biomart database
+library(presto) # fast wilcox calculation
+library(readxl) # read excel input
+library(MAST) # DE test
+library(ggrepel) # label/highlight in ggplots
+library(VennDiagram) # make Venn diagram
+# set organism to zebrafish
+organism = "org.Dr.eg.db"
+```
+
+# Initial processing
+```{r Create seurat object}
+# Load 10X data processed by cell ranger count (v6)
+wt_06hpb.data <- Read10X("10xMatrices/B_06hpb/")
+wt_24hpb.data <- Read10X("10xMatrices/B_24hpb/")
+wt_48hpb.data <- Read10X("10xMatrices/B_48hpb/")
+wt_03dpf.data <- Read10X("10xMatrices/U_03dpf/")
+wt_04dpf.data <- Read10X("10xMatrices/U_04dpf/")
+wt_05dpf.data <- Read10X("10xMatrices/U_05dpf/")
+
+wt_06hpb <- CreateSeuratObject(counts = wt_06hpb.data, project = "B_06hpb")
+wt_24hpb <- CreateSeuratObject(counts = wt_24hpb.data, project = "B_24hpb")
+wt_48hpb <- CreateSeuratObject(counts = wt_48hpb.data, project = "B_48hpb")
+wt_03dpf <- CreateSeuratObject(counts = wt_03dpf.data, project = "U_03dpf")
+wt_04dpf <- CreateSeuratObject(counts = wt_04dpf.data, project = "U_04dpf")
+wt_05dpf <- CreateSeuratObject(counts = wt_05dpf.data, project = "U_05dpf")
+
+wt_06hpb <- RenameCells(wt_06hpb, add.cell.id = "Burn_6hpb")
+wt_24hpb <- RenameCells(wt_24hpb, add.cell.id = "Burn_24hpb")
+wt_48hpb <- RenameCells(wt_48hpb, add.cell.id = "Burn_48hpb")
+wt_03dpf <- RenameCells(wt_03dpf, add.cell.id = "Unwounded_3dpf")
+wt_04dpf <- RenameCells(wt_04dpf, add.cell.id = "Unwounded_4dpf")
+wt_05dpf <- RenameCells(wt_05dpf, add.cell.id = "Unwounded_5dpf")
+
+wt.list <- c(wt_03dpf, wt_04dpf, wt_05dpf, wt_06hpb, wt_24hpb, wt_48hpb)
+```
+
+## QCs
+```{r QC scoring}
+# list of hemoglobin genes
+hemo.genes <- c("hbaa1","hbaa2","hbae1.1","hbae1.3","hbae3","hbae5","hbba1","hbba2","hbbe1.1","hbbe2","hbbe3","hbbe1.2","hbbe1.3")
+
+# Calculate mitochondrial, ribosomal, and hemoglobin contributions
+for (i in seq(1,6,1)){
+  wt.list[[i]][["percent.mt"]] <- PercentageFeatureSet(wt.list[[i]], pattern = "^mt-")
+  wt.list[[i]][["percent.ribo"]] <- PercentageFeatureSet(wt.list[[i]], pattern = "^rp[sl]")
+  total_cts_per_cell_ctrl <- colSums(wt.list[[i]]@assays$RNA@counts)
+   hemo.genes.ctrl <- match(hemo.genes, rownames(wt.list[[i]]))
+   hemo.genes.ctrl <- hemo.genes.ctrl[!is.na(hemo.genes.ctrl)]
+   wt.list[[i]][["percent.hb"]] <- colSums(wt.list[[i]]@assays$RNA@counts[rownames(wt.list[[i]])[hemo.genes.ctrl], ])/total_cts_per_cell_ctrl
+}
+```
+
+```{r doublet finding}
+# Define function for total cell number based doublet finding
+runDoubletFinder <- function(seurat.object,sct.norm=FALSE){
+  cell.names <- rownames(seurat.object@meta.data)
+  ncells <- length(cell.names)
+  ratio = 7.6/100;
+  if (ncells <=500) ratio = 0.4/100;
+  if (ncells <=1000) ratio = 0.8/100;
+  if (ncells <=2000) ratio = 1.6/100;
+  if (ncells <=3000) ratio = 2.3/100;
+  if (ncells <=4000) ratio = 3.1/100;
+  if (ncells <=5000) ratio = 3.9/100;
+  if (ncells <=6000) ratio = 4.6/100;
+  if (ncells <=7000) ratio = 5.4/100;
+  if (ncells <=8000) ratio = 6.1/100;
+  if (ncells <=9000) ratio = 6.9/100;
+  nExp_poi <- round(ratio*ncells)
+  pN=0.25
+  pK=0.09
+    seurat.object <- doubletFinder_v3(seurat.object, PCs = 1:10, pN = 0.25, pK = 0.09, nExp = nExp_poi, reuse.pANN = FALSE, sct = sct.norm)
+  return(seurat.object)
+}
+
+# Filter by pct.mt<20, nfeatures>200
+for (i in seq(1,6,1)){
+  obj <- wt.list[[i]]
+  obj <- subset(obj, subset = nFeature_RNA > 200 & percent.mt < 20 & nCount_RNA > 1500)
+  obj <- runDoubletFinder(obj, sct.norm = TRUE)
+  wt.list[[i]] <- obj[,which(colnames(obj) %in% rownames(obj@meta.data)[which(obj@meta.data[, ncol(obj@meta.data)] == "Singlet")] )]
+}
+```
+
+```{r cell cycle scoring}
+fishCCgenes <- readLines(con = "regev_lab_cell_cycle_genes_asFish.txt") 
+s.genes <- fishCCgenes[1:42]
+g2m.genes <- fishCCgenes[43:96]
+
+# Calculate cell cycle score for each object
+wt.list <- lapply(X = wt.list, FUN = function(x){
+  x  <- NormalizeData(x)
+  x <- CellCycleScoring(object = x,
+                        g2m.features = g2m.genes, s.features = s.genes)
+  x
+})
+```
+
+## Harmony Integration
+```{r harmony integration}
+wt.inte <- Merge_Seurat_List(wt.list, add.cell.ids = NULL, merge.data = TRUE)
+DefaultAssay(wt.inte) <- "RNA"
+wt.inte <- FindVariableFeatures(wt.inte)  %>%
+  ScaleData() %>%
+  RunPCA(npcs = 100) %>% 
+  RunUMAP(dims = 1:100, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+wt.inte <- RunHarmony(wt.inte,group.by.vars = 'orig.ident')
+
+wt.inte<-RunUMAP(wt.inte,dims=1:100,reduction='harmony',reduction.name='umap.harmony_theta2',key='umapharmony_')
+wt.inte<-FindNeighbors(wt.inte,reduction = 'harmony')
+wt.inte<-FindClusters(wt.inte,resolution=0.1)
+
+saveRDS(wt.inte,
+        file = 'RDS/zebrafish_burn_all-sample_RNA_Harmony_theta2_merge.rds')
+# wt.inte <- readRDS(file = 'RDS/zebrafish_burn_all-sample_RNA_Harmony_theta2_merge.rds')
+```
+
+### Population identification
+```{r marker identification}
+DefaultAssay(wt.inte) <- "RNA"
+Idents(wt.inte) <- "seurat_clusters"
+harmony.inte.markers <- FindAllMarkers(wt.inte, assay = "RNA", only.pos = TRUE)
+write.table(harmony.inte.markers, "all-sample_harmony-inte_res0.1_all_positive_markers.csv",
+            sep = ",", row.names = FALSE)
+```
+### Extract population of interest
+```{r obtain neuts and macs}
+# Keep only neutrophil and macrophage clusters
+Idents(wt.inte) <- "seurat_clusters"
+myeloid <-  subset(wt.inte, idents = c("0","1","2"))
+
+# redo integration
+sample.list <- SplitObject(myeloid, split.by = "orig.ident")
+sample.list <- lapply(X = sample.list, FUN = function(x){
+  x <- SCTransform(x, vars.to.regress = c("nFeature_RNA"))
+})
+
+features <- SelectIntegrationFeatures(object.list = sample.list, nfeatures = 3000)
+sample.list <- PrepSCTIntegration(object.list = sample.list, anchor.features = features)
+myel.anchors <- FindIntegrationAnchors(object.list = sample.list, normalization.method = "SCT",
+    anchor.features = features)
+harmony.myel <- IntegrateData(anchorset = myel.anchors, normalization.method = "SCT")
+harmony.myel <- RunPCA(harmony.myel, verbose = FALSE)
+harmony.myel <- RunUMAP(harmony.myel, reduction = "pca", dims = 1:30)
+harmony.myel <- FindNeighbors(harmony.myel, reduction = "pca", dims = 1:30)
+harmony.myel <- FindClusters(harmony.myel, resolution = 0.3)
+
+saveRDS(harmony.myel, file = "RDS/zebrafish_burn_all-sample_RNA_Harmony_myeloid.rds")
+```
+
+```{r obtain major populations in myeloid cells}
+# keep only clusters with 2% in at least 3 samples
+Idents(harmony.myel) <- "integrated_snn_res.0.3"
+harmony.myel.sub <- subset(harmony.myel, idents = seq(0,9,1))
+## rerun non-linear dimensional reduction
+
+sample.list <- SplitObject(harmony.myel.sub, split.by = "orig.ident")
+sample.list <- lapply(X = sample.list, FUN = function(x){
+  x <- SCTransform(x, vars.to.regress = c("nFeature_RNA"))
+})
+
+features <- SelectIntegrationFeatures(object.list = sample.list, nfeatures = 3000)
+sample.list <- PrepSCTIntegration(object.list = sample.list, anchor.features = features)
+myel.anchors <- FindIntegrationAnchors(object.list = sample.list, normalization.method = "SCT",
+    anchor.features = features)
+burn <- IntegrateData(anchorset = myel.anchors, normalization.method = "SCT")
+burn <- RunPCA(burn, verbose = FALSE)
+burn <- RunUMAP(burn, reduction = "pca", dims = 1:30)
+burn <- FindNeighbors(burn, reduction = "pca", dims = 1:30)
+burn <- FindClusters(burn, resolution = 0.3) 
+
+saveRDS(burn, file = "RDS/zebrafish_burn_all-sample_RNA_Harmony_myeloid_sub.rds")
+```
+
+### Population annotation
+```{r Marker identification in myeloid cells}
+# Identify markers 
+Idents(burn) <- "integrated_snn_res.0.3"
+DefaultAssay(burn) <- "RNA"
+myel.markers <- FindAllMarkers(burn, assay = "RNA", only.pos = TRUE)
+write.table(myel.markers, "all-sample_harmony-inte_myeloid-sub_only_positive_markers.csv",
+            sep = ",", row.names = FALSE)
+```
+```{r name each population}
+# update metadata and remove unnecessary columns 
+burn@meta.data %>% separate(col = "orig.ident", into = c("Cond","Time"), 
+                                   sep = "_", remove = F) %>%
+  mutate(Condition = case_when(Cond %in% "U" ~ "Unwounded", Cond %in% "B" ~ "Burn")) %>%
+  mutate(Timepoint = case_when(Time %in% c("03dpf","06hpb") ~ "T1", Time %in% c("04dpf","24hpb") ~ "T2", Time %in% c("05dpf","48hpb") ~ "T3")) %>%
+  mutate(abbreviation = orig.ident) %>%
+  select(orig.ident,abbreviation,Cond,Condition,Time,Timepoint,
+         nCount_RNA,nFeature_RNA,percent.mt,percent.ribo,percent.hb,
+         S.Score,G2M.Score,Phase,nCount_SCT,nFeature_SCT,integrated_snn_res.0.3) -> burn@meta.data
+
+# name populations
+current.clid <- seq(0,9,1)
+new.clid <- c("ccl34a.4_Macs", "lgals3bpb_Mac1","Immature_Neuts","cx43_Macs",
+              "Precursor-like_Neuts","il6r_padi2_Neuts",
+              "Cycling_Mac1","Mature_Neuts", "Cycling_Mac2", "lgals3bpb_Mac2") 
+
+burn[["Identity"]] <- plyr::mapvalues(x = burn$integrated_snn_res.0.3, from = current.clid, to = new.clid)  
+burn[["Identity"]] <- factor(burn$Identity, levels = c("ccl34a.4_Macs", "lgals3bpb_Mac1","lgals3bpb_Mac2","cx43_Macs","Cycling_Mac1","Cycling_Mac2",
+              "Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts",
+              "Mature_Neuts"))
+
+burn[["rev_Id"]] <- factor(burn$Identity, levels = rev(c("ccl34a.4_Macs", "lgals3bpb_Mac1","lgals3bpb_Mac2","cx43_Macs","Cycling_Mac1","Cycling_Mac2",
+              "Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts",
+              "Mature_Neuts")))
+
+# Neuts only
+current.clid <- levels(burn$Identity)
+new.clid <- c(rep("Macrophage", 6), rep("Neutrophil", 4))
+burn[["CellType"]] <- plyr::mapvalues(x = burn$Identity, from = current.clid, to = new.clid) 
+Idents(burn) <- "CellType"
+neuts <- subset(burn, idents = "Neutrophil")
+
+## Remove outliers in neutrophils
+neuts.sub <- subset(neuts, subset = UMAP_1 > 2)
+
+# macs only
+macs <- subset(burn, idents = "Macrophage")
+
+saveRDS(burn, file = "RDS/zebrafish_burn_all_sample_integrated_myeloid_cells.rds")
+```
+
+```{r top marker QC}
+myel.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC) -> top5
+## Remove duplicated gene
+genelist <- top5$gene[!duplicated(top5$gene)]
+## Plot as dotplot for both macs and neuts
+DotPlot(burn, features = rev(genelist), group.by = "Identity", col.min = 0) + RotatedAxis() + coord_flip() + theme(text = element_text(size = 8), axis.text = element_text(size = 8)) + scale_size(range = c(0,3))
+ggsave("Plots/QC/all-sample_harmony-inte_myeloid-sub_top5_dotplt.svg",
+       width = 7, height = 8, dpi = 300)
+```
+
+## Human ortholog replacement 
+```{r match gene pairs}
+ensembl <- useMart("ensembl")
+dr_mart<-useDataset(dataset = 'drerio_gene_ensembl',mart=ensembl)
+mapping2<-getBM(attributes = c('external_gene_name','zfin_id_symbol','entrezgene_id'),
+                values = rownames(burn@assays$RNA@counts),
+                mart=dr_mart)
+keep_genes<-mapping2[!is.na(mapping2$entrezgene_id),]
+
+# Define function for obtaining gene pairs from DIOPT
+diopt_ortho <- function(gene_id,source_org=7955,target_org=9606){
+  test <- fromJSON(paste("https://www.flyrnai.org/tools/diopt/web/diopt_api/v9/get_orthologs_from_entrez/",source_org,"/",gene_id,"/",target_org,"/best_match",sep=""))
+  if (length(test$results)>0){
+    x<-names(test$results)[1]
+    y<-names(test$results[[x]])[1]
+    as_tibble(test$results[[x]][[y]]) %>% dplyr::select(symbol,score,confidence) %>% unique() -> b
+    as_tibble(test$search_details$gene_details) %>% dplyr::select(symbol_cs,description) %>% unique() -> a
+    q <- cbind(a,b)
+    colnames(q)<-c('Source_Gene','Description','Target_Gene','Score','Confidence')
+    q<-q[,c('Source_Gene','Target_Gene','Score','Confidence','Description')]
+    return(q) 
+  }
+}
+# iterate and search for each gene
+acc_list_hs<-list()
+num_its<-0
+for (i in keep_genes$entrezgene_id){
+  num_its<-num_its+1
+  new_idx<-length(acc_list_hs)+1
+  acc_list_hs[[new_idx]]=diopt_ortho(i)
+  if (num_its %% 100 == 0){
+    print(num_its)
+    print(new_idx)
+  }
+}
+converted_genes_hs<-Reduce(rbind,acc_list_hs)
+```
+
+```{r construct seurat with human orthologs}
+Idents(burn)<-'Identity'
+
+#Filter to high diopt scores and get pairs of human and zebrafish genes
+converted_genes_hs %>% filter(Score>6) -> high_score_genes
+colnames(high_score_genes) <- c("Zebrafish_Gene","Human_Gene","Score","Confidence","Description")
+high_score_pairs <- high_score_genes %>% dplyr::select(Human_Gene,Zebrafish_Gene)
+input_genes <- rownames(burn@assays$RNA@data)
+
+#filter pairs that are in zebrafish dataset
+match <- high_score_pairs[high_score_pairs$Zebrafish_Gene %in% input_genes,]
+
+#Create empty matrix to input scores, and empty vector to store human gene names
+add_mat<-matrix(,ncol = dim(burn)[2])
+add_names<-c()
+
+#Iterate over human genes
+for (hg in unique(match$Human_Gene)){
+  #extract zebrafish gene that matches human gene
+  zf_genes<-match[match$Human_Gene==hg,'Zebrafish_Gene']
+  zf_genes<-zf_genes[zf_genes %in% input_genes]
+  #In the case where there are multiple matches, extract highest expressed genes in each cell using column max
+  if (length(zf_genes)>1){
+    add_mat<-rbind(add_mat,colMaxs(burn@assays$RNA@counts[zf_genes,]))
+    add_names<-c(add_names,hg)
+    #Counter to check iterations
+    if (length(add_names)%%100==0){
+      print(length(add_names))
+    }
+  }
+}
+
+#In the case of single matches, extract genes individually
+single_rel <- match[!match$Human_Gene %in% add_names,]
+add_mtx <- add_mat[-1,] 
+rownames(add_mtx) <- add_names
+colnames(add_mtx) <- colnames(burn@assays$RNA@counts)
+test_mtx <- burn@assays$RNA@counts
+input_mtx <- burn@assays$RNA@counts
+input_mtx <- input_mtx[rownames(input_mtx) %in% single_rel$Zebrafish_Gene,]
+rownames(single_rel) <- single_rel$Zebrafish_Gene
+rownames(input_mtx) <- single_rel[rownames(input_mtx),]$Human_Gene
+
+#Combine single and multimatches
+final_mtx <- rbind(input_mtx,add_mtx)
+final_mtx <- rbind(final_mtx,test_mtx['il6',]) # dim 12617
+rownames(final_mtx)[12617]='IL6'
+tail(final_mtx)
+
+#Construct seurat object from ortholog matrix and normalize using log normalization, save object
+zfish_human_ortho <- CreateSeuratObject(counts=final_mtx, project = 'Zebrafish_Human_Ortholog')
+zfish_human_ortho@meta.data <- burn@meta.data
+zfish_human_ortho <- NormalizeData(zfish_human_ortho, 
+                                   normalization.method = "LogNormalize", scale.factor = 10000)
+Idents(zfish_human_ortho)<-"Identity"
+saveRDS(zfish_human_ortho, 
+        file = 'RDS/zebrafish_burn_all_sample_integrated_myeloid_human_ortholog.rds')
+# zfish_human_ortho <- readRDS(file = 'RDS/zebrafish_burn_all_sample_integrated_myeloid_human_ortholog.rds')
+```
+
+## Processing of Montaldo et al. data
+```{r}
+# received a seurat object from the group and further downsample
+Montaldo_downsample <- readRDS(file = 'RDS/Montaldo_Neutrophils_downsample2654cells.rds')
+```
+
+
+# Figures
+```{r color panel}
+cl.colors <- DiscretePalette_scCustomize(num_colors = 11, palette = "ditto_seq")[c(1:6,8:11)]
+names(cl.colors) <- c("ccl34a.4_Macs", "lgals3bpb_Mac1","lgals3bpb_Mac2","cx43_Macs","Cycling_Mac1","Cycling_Mac2",
+              "Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts",
+              "Mature_Neuts") 
+```
+
+## Figure 1
+```{r Supp. Fig. 1A all cells UMAP}
+# use SCT-CCA integration version of all cells
+current.clid <- seq(0,7,1) 
+new.clid <-  c("Macrophage","Neutrophil","Cycling myeloid","Photoreceptor","Epithelial","Unknown","Lateral line","Erythrocyte")
+              
+wt.inte[["Temp_identity"]] <- plyr::mapvalues(x = wt.inte$seurat_clusters, from = current.clid, to = new.clid)
+wt.inte[["Temp_identity"]] <- factor(wt.inte$Temp_identity, 
+                             levels = rev(c("Neutrophil","Macrophage","Cycling myeloid","Lateral line","Epithelial","Erythrocyte","Photoreceptor","Unknown")))
+
+wt.inte[["rev_identity"]] <- factor(wt.inte$Temp_identity, 
+                             levels = c("Neutrophil","Macrophage","Cycling myeloid","Lateral line","Epithelial","Erythrocyte","Photoreceptor","Unknown"))
+
+DimPlot(wt.inte, group.by = "rev_identity", cols = DiscretePalette_scCustomize(num_colors = 8, palette = "ditto_seq")) +
+  theme(text = element_text(size = 8), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig1A_integrated_all_major_UMAP_gb-tempid.svg", 
+       width = 4, height = 3, dpi = 300)
+```
+
+```{r Supp. Fig. 1B all cells dot plt}
+# use SCT-CCA integration version of all cells
+markers <- c("mpx", "lyz", # Neut 
+             "mpeg1.1", "marco", # macs
+             "mki67","top2a", # cell cycle
+             "prox1a", "f11r.1", # lateral line.
+             "cldnb","krt4", # Epithelial
+             "hbae1.1","hemgn", # red blood cell
+             "opn1mw1","gnb3b", # cones
+             "cebpd","her6" # 
+             )
+
+DotPlot(wt.inte, features = markers, group.by = "Temp_identity") + RotatedAxis() +
+  theme(text = element_text(size = 8), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8)) + scale_size(range = c(0.1,4))
+ggsave("Plots/Fig1/Supp_Fig1B_integrated_MajorCellTypeMarkers_dotplt.svg",
+       width = 4.3, height = 2.2)
+```
+
+```{r Fig. 1B subset coloring UMAP}
+# use Harmony version of myeloid cell
+DimPlot(burn, reduction = "umap", group.by = "Identity", 
+        cols = cl.colors) + 
+  theme(text = element_text(size = 8), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Fig1B_myeloid_subset_labelled_UMAP.svg",
+       width = 3.5, height = 2.5)
+```
+
+```{r Fig. 1C example marker expression vln}
+# use Harmony version of myeloid cell
+DefaultAssay(burn) <- "RNA"
+vln.genes <- c("ccl34a.4","lgals3bpb","ppdpfb","cx43","mki67","fabp3", "lyz","mmp9","il6r","padi2","hsp70.3")
+
+VlnPlot(burn, features = vln.genes, 
+        cols = cl.colors,
+        group.by = "rev_Id",
+        stack = TRUE, flip = FALSE, fill.by = "ident") +
+  theme(axis.text.x = element_text(angle = -90, vjust = 0,hjust = 0.5, size = 8),
+        axis.title.x = element_text(size = 8),
+        axis.text.y.right = element_text(size = 8),
+        axis.text= element_text(size=8) , 
+        axis.title.y = element_text(size=8),
+        legend.text = element_text(size = 8))
+ggsave("Plots/Fig1/Fig1C_keymarkers_myeloid_subset_vlnplt_gb-Id.svg", width = 5, height = 3)
+```
+
+```{r Supp. Fig. 1C myeloid marker dotplot}
+# use Harmony version of myeloid cell
+Idents(burn) <- "Identity"
+all.posi.markers <- FindAllMarkers(burn, assay = "RNA", only.pos = TRUE)
+
+cluster_order <- c("ccl34a.4_Macs", "lgals3bpb_Mac1","lgals3bpb_Mac2","cx43_Macs","Cycling_Mac1","Cycling_Mac2","Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts")
+
+# Extract top5 genes
+all.posi.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) %>%
+    arrange(match(cluster, cluster_order)) -> top5
+
+# Remove duplicated gene
+genelist <- top5$gene[!duplicated(top5$gene)]
+
+# Plot as dotplot for both macs and neuts
+DotPlot(burn, features = rev(genelist), group.by = "Identity", col.min = 0) + RotatedAxis() + coord_flip() + theme(text = element_text(size = 8), axis.text = element_text(size = 8)) + scale_size(range = c(0,3))
+
+ggsave("Plots/Fig1/Supp_Fig1C_subset_marker_top5_allcells_sb-Id_coordflip_colmin0_dotplot.svg", width = 3.8, height = 6.3)
+```
+
+```{r Supp. Fig. 2 feature plot for subset markers}
+# selected ones. can add when needed
+genelist <- c("ccl34a.4", "pglyrp5","ccl34b.1", "lgals3bpb",
+              "ppdpfb", "cx43", "hmgb2b", "mki67", 
+              "fabp3","npm1a", "lyz", "mmp9", "mpx","il6r","il4", 
+              "padi2","hsp70.3", "hsp70l")
+# Feature plot 
+FeaturePlot(burn, features = genelist, cols = c("lightgrey","black"), ncol = 4) &
+  theme(text = element_text(size = 8), axis.text = element_text(size = 8),
+        legend.key.size = unit(4,'mm'))
+ggsave("Plots/Fig1/Supp_Fig2_selected_myeloid-subset_top_marker_ftplt.pdf",
+       width = 7.5, height = 9.5, dpi = 300)
+```
+
+```{r Supp. Fig. 3 cell cycle scoring}
+# scoring on UMAP
+FeaturePlot(burn, features = c("S.Score","G2M.Score"), ncol = 2) &
+  theme(text = element_text(size = 8), axis.text = element_text(size = 8),
+        legend.key.size = unit(4,'mm'))
+ggsave("Plots/Fig1/Supp_Fig3A_burn_UMAP_CCscores.svg", width = 5, height = 2.5,
+       dpi = 300)
+
+# scoring as violin plots
+VlnPlot(burn, features = c("S.Score","G2M.Score"), 
+        group.by = "Identity", split.by = "abbreviation",
+        stack = TRUE, fill.by = "ident", flip = TRUE)  +
+  theme(text = element_text(size = 8), axis.text = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig3B_burn_CCscores_vlnplot_sb-abbr.svg", 
+       width = 6, height = 2.5, dpi = 300)
+```
+
+```{r Supp. Fig. 1D M1/M2 marker in macs}
+m1.genes <- c("tnfa","tnfb","il6","il1b",
+              "cxcl11.1","mmp9","tnfrsf1b")
+m2.genes <- c("arg1","il10","cxcr4b","ccr2","alox5ap",
+              "marco","tgfb1b")
+
+DefaultAssay(burn) <- "RNA"
+VlnPlot(burn, features = c(m1.genes,m2.genes),
+        group.by = "Identity", stack = TRUE, flip = TRUE, fill.by = "ident", 
+        cols = cl.colors) + 
+  theme(text = element_text(size = 8), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig1D_burn_m1m2markers_vlnplt.svg",
+       width = 4, height = 3.2)
+```
+
+```{r Supp. Fig. 4A zebrafish-human neutrophil identity transfer scoring}
+# complete the data processing in Initial Processing 
+zfish_human_ortho <- readRDS(file = 'RDS/zebrafish_burn_all_sample_integrated_myeloid_human_ortholog.rds')
+zfish_human_ortho <- SCTransform(zfish_human_ortho)
+zfish_human_ortho <- RunPCA(zfish_human_ortho)
+zfish_human_ortho_neut <- subset(zfish_human_ortho,subset = Identity %in% c("Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts")) 
+
+# label transfer
+neutrophil.anch <- FindTransferAnchors(reference = zfish_human_ortho_neut, query = Montaldo_downsample,
+                                       dims = 1:30, reference.reduction = "pca",normalization.method = 'SCT')
+predictions <- TransferData(anchorset = neutrophil.anch, refdata = zfish_human_ortho_neut$Identity,
+                            dims = 1:30)
+Montaldo_downsample <- AddMetaData(Montaldo_downsample, metadata = predictions)
+Montaldo_downsample$stage <- factor(Montaldo_downsample$stage, 
+                                    levels = c("Precursor","EarlyImmature","Immature","Mature"))
+ 
+Montaldo_downsample$PredictedID <- factor(Montaldo_downsample$predicted.id, 
+                                          levels = c("Precursor-like_Neuts","Immature_Neuts", "Mature_Neuts"))
+
+# fish neut score distribution
+Montaldo_downsample@meta.data %>% dplyr::select(stage,                                        prediction.score.Precursor.like_Neuts,prediction.score.Immature_Neuts,                                         prediction.score.il6r_padi2_Neuts,prediction.score.Mature_Neuts) %>%
+  dplyr::mutate(name = rownames(Montaldo_downsample@meta.data)) %>%
+  gather(identity, score, prediction.score.Precursor.like_Neuts:prediction.score.Mature_Neuts) -> hs_neuts_meta.long
+
+ggplot(hs_neuts_meta.long, aes(x = score, fill = stage)) +
+  geom_density(alpha = 0.4, linewidth = 0.2) +
+  facet_wrap(~identity, scales = "free_y") + 
+  theme(text = element_text(size = 8)) 
+ggsave("Plots/Fig1/Supp_Fig4A_human_neuts_stage_fish_subset_score_distribution_density.svg", 
+       width = 4.5, height = 3.2, dpi = 300)
+ggplot(hs_neuts_meta.long, aes(x = score, fill = stage)) +
+  geom_density(alpha = 0.4, linewidth = 0.2) +
+  facet_wrap(~identity) + 
+  scale_y_continuous(limits = c(0,5)) +
+  theme(text = element_text(size = 8)) 
+ggsave("Plots/Fig1/Supp_Fig4A_human_neuts_stage_fish_subset_score_distribution_density_y-fix.svg", 
+       width = 4.5, height = 3.2, dpi = 300)
+```
+
+```{r Fig. 1D zebrafish-human neutrophil identity match heatmap}
+# plot identity overlay as heatmap
+col_fun <- colorRamp2(c(0,1000,2000), c("#FFFFCC","#FD8D3C","#800026"))
+svglite("Plots/Fig1/Fig1D_zebrafish-to-human_id_match_htmap.svg",
+       width = 3, height = 1.8)
+ht <- Heatmap(table(Montaldo_downsample$PredictedID, Montaldo_downsample$stage),
+        name = "ID match", col = col_fun,
+        cluster_rows = FALSE, cluster_columns = FALSE, 
+        column_names_gp = grid::gpar(fontsize = 8),
+        row_names_gp = grid::gpar(fontsize = 8))
+draw(ht)
+dev.off()
+```
+
+```{r Supp. Fig. 4B zebrafish identity on human neutrophils}
+# plot zebrafish identity on human neutrophil UMAP
+p1 <- DimPlot(Montaldo_downsample,group.by = 'stage')
+p2 <- DimPlot(Montaldo_downsample,group.by = 'PredictedID') +
+  scale_color_manual(values = cl.colors)
+p1 + p2 & theme(text = element_text(size = 8),
+                axis.text=element_text(size=8) , 
+                legend.position = "bottom", legend.direction = "vertical")
+ggsave(filename = "Plots/Fig1/Supp_Fig4B_zebrafish-to-human_id_match_UMAP.svg", width = 3.6, height = 3.2)
+```
+
+```{r Supp. Fig. 5 zebrahub expression confirmation}
+#### zebrahub visualization
+# convert adata to seurat format
+# Convert("zf_atlas_full_v4_release.h5ad", 
+#         dest = "h5seurat")
+# Z:/Lab Huttenlocher/1 Lab Data/Sequencing/ZebraHub/
+zf_atlas <- LoadH5Seurat("zf_atlas_full_v4_release.h5seurat", assay = "RNA")
+# visualize myeloid location
+Idents(zf_atlas) <- "timepoint"
+zf_atlas.5dpf <- subset(zf_atlas, idents = "5dpf")
+DimPlot(zf_atlas.5dpf, group.by = "zebrafish_anatomy_ontology_class") &
+   theme(text = element_text(size = 8), 
+        axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig5A_zfatlas_5dpf_umap.svg",
+       width = 3.55, height = 2.33)
+
+FeaturePlot(zf_atlas.5dpf, features = c("mpx", "lyz", "mpeg1.1", "marco")) &
+  theme(text = element_text(size = 8), 
+        axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig5B_zfatlas_5dpf_neuts-macs_ftplt.svg",
+       width = 5, height = 4.5)
+
+# Extract myeloid cells
+p <- DimPlot(zf_atlas, group.by = "zebrafish_anatomy_ontology_class")
+zf_atlas <- CellSelector(plot = p, object = zf_atlas, ident = 'SelectedCells')
+zf_atlas.mye <- subset(zf_atlas, idents = "SelectedCells")
+saveRDS(zf_atlas.mye, file = "RDS/zebrahub_myeloid-cells_all_time.rds")
+# visualize expression/co-expression
+FeaturePlot(zf_atlas.mye, features = c("il6r","padi2"), blend = T, pt.size = 0.5, order = T) &
+  theme(text = element_text(size = 8), 
+        axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig5C_zfatlas_mye_il6r-padi2_ftplt.svg",
+       width = 7, height = 2)
+
+FeaturePlot(zf_atlas.mye, features = c("mpx","padi2"), blend = T, pt.size = 0.5, order = T) &
+  theme(text = element_text(size = 8), 
+        axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig5C_zfatlas_mye_mpx-padi2_ftplt.svg",
+       width = 7, height = 2)
+```
+```{r Supp. Fig. 5 TLN confirmation}
+# Import data from TF. Robertson, 2023
+integrated <- LoadH5Seurat(file = "RDS/TcellsComb_dblrm_CCAinte_post_dblrm_redoSCT_UMAP30_res05_celltype_labeled.h5Seurat")
+FeaturePlot(integrated, features = "mpx") &
+  theme(text = element_text(size = 8), 
+        axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig5D_TLN_integrated_mpx_ftplt.svg",
+       width = 3, height = 3)
+# Extract neutrophils
+Idents(integrated) <- "relev_id"
+neuts <- subset(integrated, idents = c("Neutrophil"))
+DefaultAssay(neuts) <- "integrated"
+neuts <- RunPCA(neuts, npcs = 50)
+ElbowPlot(neuts, ndims = 50)
+# Non-linear dim reduction
+neuts <- RunUMAP(neuts, reduction = "pca", dims = 1:10)
+neuts <- FindNeighbors(neuts, reduction = "pca", dims = 1:10)
+neuts <- FindClusters(neuts, resolution = 0.4)
+# saveRDS(neuts, file = "RDS/TLN_integrated_neutrophils.rds")
+neuts <- readRDS(file = "RDS/TLN_integrated_neutrophils.rds")
+DefaultAssay(neuts) <- "RNA"
+FeaturePlot(neuts, features = c("il6r","padi2"), 
+            blend = T, pt.size = 0.5, order = T) &
+  theme(text = element_text(size = 8), 
+        axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig1/Supp_Fig5D_TLN_integrated_il6r-padi2_ftplt.svg",
+       width = 7, height = 2)
+
+```
+
+```{r Fig. 1E subset proportion areaplot}
+# split neuts/macs into burn and unwounded and do each area plot separately
+Idents(neuts) <- "Condition"
+unwounded.neuts <- subset(neuts, idents = "Unwounded")
+burn.neuts <- subset(neuts, idents = "Burn")
+Idents(macs) <- "Condition"
+unwounded.macs <- subset(macs, idents = "Unwounded")
+burn.macs <- subset(macs, idents = "Burn")
+# create a function for generating the area plot
+prop_area_plot <- function(dataset, name){
+ pop.struc <- data.frame(table(dataset$Timepoint, dataset$Identity))
+ colnames(pop.struc) <- c("Timepoint","Cell_types","Proportions")
+ plt.nm <- paste0("Plots/Fig1/Fig1E_subset_prop_",name,"_areaplt.svg")
+ plot <- ggplot(data = pop.struc, aes(x = Timepoint, y = Proportions, group = Cell_types, fill = Cell_types)) +
+  geom_area(position = "fill") +
+  scale_fill_manual(values = cl.colors) +
+  theme_bw() + 
+  theme(axis.text= element_text(size=8),
+        axis.title.x = element_text(size=8),
+        axis.title.y = element_text(size=8),
+        axis.text.x = element_text(size = 8),
+        legend.position = "none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+ print(plot)
+ ggsave(plt.nm, width = 1.2, height = 1.5)
+}
+# plot individually
+prop_area_plot(burn.neuts, "burn_neuts")
+prop_area_plot(unwounded.neuts, "unwounded_neuts")
+prop_area_plot(burn.macs, "burn_macs")
+prop_area_plot(unwounded.macs, "unwounded_macs")
+```
+
+```{r Supp. Fig. 1E delta difference}
+# calculate within neuts and macs respectively
+neuts_prop <- prop.table(table(neuts$Identity, neuts$abbreviation),2)
+neu_delta<- reshape2::melt(cbind(sweep(neuts_prop[c(7:10),1:3],MARGIN = 1,STATS = neuts_prop[c(7:10),1],FUN = '-'),
+                      sweep(neuts_prop[c(7:10),4:6],MARGIN = 1,STATS = neuts_prop[c(7:10),4],FUN = '-')))
+colnames(neu_delta)=c('Neutrophil_Subset','Condition_Timepoint','Frequency_Delta')
+neu_delta%>%mutate(Condition=case_when(Condition_Timepoint %in% c('B_06hpb','B_24hpb','B_48hpb') ~ 'Burn',Condition_Timepoint %in% c('U_03dpf','U_04dpf','U_05dpf') ~ 'Unwounded'))->neu_delta
+neu_delta%>%mutate(Timepoint=case_when(Condition_Timepoint %in% c('B_06hpb','U_03dpf') ~ "T1", Condition_Timepoint %in% c('B_24hpb','U_04dpf') ~ "T2", Condition_Timepoint %in% c('B_48hpb','U_05dpf') ~ "T3"))->neu_delta
+neu_delta%>%mutate(Subset_Condition=paste(Condition,Neutrophil_Subset,sep='_'))->neu_delta
+
+macs_prop <- prop.table(table(macs$Identity, macs$abbreviation),2)
+mac_delta<- reshape2::melt(cbind(sweep(macs_prop[c(1:6),1:3],MARGIN = 1,STATS = macs_prop[c(1:6),1],FUN = '-'),
+                      sweep(macs_prop[c(1:6),4:6],MARGIN = 1,STATS = macs_prop[c(1:6),4],FUN = '-')))
+colnames(mac_delta)=c('Macrophage_Subset','Condition_Timepoint','Frequency_Delta')
+mac_delta%>%mutate(Condition=case_when(Condition_Timepoint %in% c('B_06hpb','B_24hpb','B_48hpb') ~ 'Burn',Condition_Timepoint %in% c('U_03dpf','U_04dpf','U_05dpf') ~ 'Unwounded'))->mac_delta
+mac_delta%>%mutate(Timepoint=case_when(Condition_Timepoint %in% c('B_06hpb','U_03dpf') ~ "T1", Condition_Timepoint %in% c('B_24hpb','U_04dpf') ~ "T2", Condition_Timepoint %in% c('B_48hpb','U_05dpf') ~ "T3"))->mac_delta
+mac_delta%>%mutate(Subset_Condition=paste(Condition,Macrophage_Subset,sep='_'))->mac_delta
+
+names(mac_delta) <- c("Subset","Condition_Timepoint","Frequency_Delta","Condition","Timepoint","Subset_Condition")
+names(neu_delta) <- c("Subset","Condition_Timepoint","Frequency_Delta","Condition","Timepoint","Subset_Condition")
+mye_delta <- rbind(mac_delta, neu_delta)
+mye_delta %>%
+  mutate(Celltype=case_when(Subset %in% c("ccl34a.4_Macs","lgals3bpb_Mac1","lgals3bpb_Mac2","cx43_Macs","Cycling_Mac1","Cycling_Mac2") ~ "Macs", Subset %in% c("Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts") ~ "Neuts")) -> mye_delta
+mye_delta$Condition <- factor(mye_delta$Condition, levels = c("Burn","Unwounded"))
+mye_delta$Timepoint <- factor(mye_delta$Timepoint, levels = c("T1", "T2", "T3"))
+mye_delta$Celltype <- factor(mye_delta$Celltype, levels = c("Macs", "Neuts"))
+
+## shape panel
+cl.shape <- c(16,1)
+names(cl.shape) <- c("Burn","Unwounded")
+## wrap by myeloid cell, plot both together
+ggplot(data=mye_delta,aes(y=Frequency_Delta,x=Timepoint,group=Subset_Condition)) + 
+  geom_point(aes(color=Subset, shape=Condition), size = 2) + 
+  geom_line(aes(color=Subset))  + 
+  scale_color_manual(values = cl.colors) + 
+  scale_shape_manual(values = cl.shape) +
+  ylab('Change in Subset Frequency \n(wrt 1st Timepoint)') + 
+  facet_wrap(~Celltype)
+  #ggtitle('Changes in Macrophage Subset Frequency over Time and Condition') + 
+  theme(text = element_text(size = 8), plot.margin = margin(0.9,0,0.8,0.2,"cm")) 
+ggsave("Plots/Fig1/Supp_Fig1E_proportion_mye_delta.svg", width = 5, height = 2.2, dpi = 300)
+```
+
+## Figure 2
+```{r Fig. 2A neutrophil subset pseudobulk hierarchical clustering}
+DefaultAssay(neuts) <- "RNA"
+neuts <- FindVariableFeatures(neuts, selection.method = "vst", nfeatures = 2000) 
+# calculate average data
+neuts[["Cond_Id"]] <- paste(neuts$abbreviation, neuts$Identity, sep = "|")
+Idents(neuts) <- "Cond_Id"
+Average_data <- AverageExpression(neuts, assays = "RNA", slot = "data")
+
+# calculate correlation
+HVG_data <- Average_data$RNA[neuts@assays$RNA@var.features,]
+# Calculate pearson correlation using top 2000 HVGs
+HVG_corr <- cor(HVG_data, method = "pearson")
+melted_corr <- reshape2::melt(HVG_corr)
+
+
+# set heatmap metadata
+anndata <- read.csv("bulk_sample_neuts_meta.csv", header = TRUE)
+ann <- data.frame(anndata, row.names = anndata$X) %>% 
+  dplyr::select(CondTime, Identity)
+ann <-ann[colnames(HVG_corr), ]
+
+ann.col <- list("CondTime" = c("U_03dpf" = "#0000FF", "U_04dpf" = "#A2A2FF","U_05dpf" = "#DEDEFF",
+                               "B_06hpb" = "#FF0000","B_24hpb" = "#FFA2A2","B_48hpb" = "#FFDEDE"),
+                "Identity" = c("Precursor-like_Neuts" = "#666666", 
+                           "Immature_Neuts" = "#AD7700",
+                           "il6r_padi2_Neuts" = "#1C91D4",
+                           "Mature_Neuts" = "#007756",
+                           "ccl34a.4_Macs" = "#E69F00",
+                           "lgals3bpb_Mac1" = "#56B4E9",
+                           "lgals3bpb_Mac2" = "#009E73",
+                           "cx43_Macs" = "#F0E442",
+                           "Cycling_Mac1" = "#0072B2",
+                           "Cycling_Mac2" = "#D55E00"))
+
+colAnn <- HeatmapAnnotation(df = ann, which = 'col',
+                            col = ann.col, annotation_name_side = "left", 
+                            annotation_width = unit(c(6.5,2), 'cm'), 
+                            gap = unit(1, 'mm'), 
+                            annotation_name_gp= gpar(fontsize = 8), 
+                            annotation_legend_param = list("CondTime" = list(at = c("U_03dpf", "U_04dpf","U_05dpf","B_06hpb","B_24hpb","B_48hpb")), "Identity" = list(title = "Subset", at = c("Precursor-like_Neuts","Immature_Neuts", "il6r_padi2_Neuts", "Mature_Neuts"))))
+
+col_fun = colorRamp2(c(0, 0.5, 1), c("white","orange","red"))
+# set heatmap parameters
+ht_opt$heatmap_row_names_gp = gpar(fontsize = 8)
+ht_opt$legend_title_gp = gpar(fontsize = 8)
+ht_opt$legend_labels_gp = gpar(fontsize = 8)
+
+# Plot HVG version pseudobulk correlations
+ht <- Heatmap(HVG_corr, name = "Pearson correlation", 
+        col = col_fun,
+        cluster_rows = TRUE, cluster_columns = TRUE, 
+        row_names_side = "left",
+        width = unit(6.5, 'cm'),
+        height = unit(6.5, 'cm'), 
+        show_row_names = FALSE, show_column_names = FALSE,
+        top_annotation = colAnn)
+svglite("Plots/Fig2/Fig2A_subset_pseudobulk_neutonly_HVG_pearsonCorr_heatmap.svg",
+        width = 8, height = 6)
+draw(ht, heatmap_legend_side = "left", annotation_legend_side = "right")
+dev.off()
+```
+
+```{r Fig. 2B PCA for pseudobulk}
+Idents(neuts) <- "Cond_Id"
+Average_data <- AverageExpression(neuts, assays = "RNA", slot = "data")
+Ave.data.mtx <- t(Average_data$RNA)
+Ave.data.mtx.var <- Ave.data.mtx[ , which(apply(Ave.data.mtx, 2, var) != 0)]
+Ave.data.mtx.log <- log1p(Ave.data.mtx.var)
+# Perform Principal Component Analysis (PCA)
+pca <- prcomp(Ave.data.mtx.log, scale. = TRUE)
+pca_perc <- round(100*pca$sdev^2/sum(pca$sdev^2),1)
+df_pca <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], sample = colnames(Average_data$RNA))
+
+# - Add metadata
+df_pca.tbl <- tibble(df_pca)
+df_pca.tbl %>% 
+  mutate(sampleNm = sample) %>%
+  separate_wider_delim(sample, "|", names=c("Abbr","CellType")) %>%
+  mutate(abbreviation = Abbr) %>% 
+  separate_wider_delim(Abbr, "_", names = c("Cond", "Time")) %>%
+  mutate(Condition = case_when(Cond %in% "U" ~ "Unwounded", Cond %in% "B" ~ "Burn")) %>%
+  mutate(Timepoint = case_when(Time %in% c("03dpf","06hpb") ~ "T1", Time %in% c("04dpf","24hpb") ~ "T2", Time %in% c("05dpf","48hpb") ~ "T3")) %>%
+  mutate(MainType = case_when(CellType %in% c("Precursor-like_Neuts","Immature_Neuts", "il6r_padi2_Neuts", "Mature_Neuts") ~ "Neutrophil")) -> df_pca.tbl
+
+# relevel factors 
+df_pca.tbl$CellType <- factor(df_pca.tbl$CellType, 
+                              levels = c("Precursor-like_Neuts","Immature_Neuts", "il6r_padi2_Neuts", "Mature_Neuts") )
+df_pca.tbl$Timepoint <- factor(df_pca.tbl$Timepoint, 
+                               levels = c("T1","T2","T3"))
+df_pca.tbl$Condition <- factor(df_pca.tbl$Condition,
+                               levels = c("Unwounded","Burn"))
+
+# Plot PCA with lines - combined plotting
+cl.shape <- c(17,15,16,2,0,1)
+names(cl.shape) <- c("B_06hpb","B_24hpb","B_48hpb","U_03dpf","U_04dpf","U_05dpf")
+ggplot(df_pca.tbl, aes(PC1,PC2, group=CellType,color = CellType)) +
+  geom_point(aes(shape=abbreviation),size = 1.8) +
+  geom_path(arrow = arrow(angle = 15, type= "closed", ends = "last" ,length = unit(0.15, "cm")),aes(color = CellType)) +
+  labs(x=paste0("PC1 (",pca_perc[1],"%)"), y=paste0("PC2 (",pca_perc[2],"%)")) +
+  scale_color_manual(values = cl.colors) + 
+  scale_shape_manual(values = cl.shape) +
+  theme(text = element_text(size = 8),  
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  facet_grid(cols = vars(Condition))
+ggsave("Plots/Fig2/Fig2B_neuts_pseudobulk_log1p_scaled_PCA_cond-time_shapes_facet-cond-maintype.svg", width = 3.6, height = 1.4)
+
+ggplot(df_pca.tbl, aes(PC1,PC2, group=CellType,color = CellType)) +
+  geom_point(aes(shape=abbreviation),size = 1.8) +
+  geom_path(arrow = arrow(angle = 15, type= "closed", ends = "last" ,length = unit(0.15, "cm")),aes(color = CellType)) +
+  labs(x=paste0("PC1 (",pca_perc[1],"%)"), y=paste0("PC2 (",pca_perc[2],"%)")) +
+  scale_color_manual(values = cl.colors) + 
+  scale_shape_manual(values = cl.shape) +
+  theme(text = element_text(size = 8),  
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  facet_grid(cols = vars(Timepoint))
+ggsave("Plots/Fig2/Fig2B_neuts_pseudobulk_log1p_scaled_PCA_cond-time_shapes_facet-time-maintype.svg", width = 4.46, height = 1.4)
+```
+
+```{r Supp. Fig. 6 Neutrophil PCA - additional PCs}
+# Extract more PC from PCA
+df_pca <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], PC3 = pca$x[,3], PC4 = pca$x[,4],  PC5 = pca$x[,5], PC6 = pca$x[,6], sample = colnames(Average_data$RNA))
+
+# - Add metadata
+df_pca.tbl <- tibble(df_pca)
+df_pca.tbl %>% 
+  mutate(sampleNm = sample) %>%
+  separate_wider_delim(sample, "|", names=c("Abbr","CellType")) %>%
+  mutate(abbreviation = Abbr) %>% 
+  separate_wider_delim(Abbr, "_", names = c("Cond", "Time")) %>%
+  mutate(Condition = case_when(Cond %in% "U" ~ "Unwounded", Cond %in% "B" ~ "Burn")) %>%
+  mutate(Timepoint = case_when(Time %in% c("03dpf","06hpb") ~ "T1", Time %in% c("04dpf","24hpb") ~ "T2", Time %in% c("05dpf","48hpb") ~ "T3")) %>%
+  mutate(MainType = case_when(CellType %in% c("Precursor-like_Neuts","Immature_Neuts", "il6r_padi2_Neuts", "Mature_Neuts") ~ "Neutrophil")) -> df_pca.tbl
+
+# relevel factors 
+df_pca.tbl$CellType <- factor(df_pca.tbl$CellType, 
+                              levels = c("Precursor-like_Neuts","Immature_Neuts", "il6r_padi2_Neuts", "Mature_Neuts") )
+df_pca.tbl$Timepoint <- factor(df_pca.tbl$Timepoint, 
+                               levels = c("T1","T2","T3"))
+df_pca.tbl$Condition <- factor(df_pca.tbl$Condition,
+                               levels = c("Unwounded","Burn"))
+
+## Define function for two PC plotting
+plot.pc.cond.time <- function(df, facet, pc1, pc1n, pc2, pc2n){
+  plt.obj <- ggplot(df, aes(eval(parse(text = pc1)),eval(parse(text = pc2)),
+                            group = CellType, color = CellType)) +
+    geom_point(aes(shape=abbreviation),size = 1.8) +
+    geom_line(arrow = arrow(angle = 15, type= "closed", ends = "last" ,length = unit(0.15, "cm")),aes(color = CellType)) +
+    labs(x=paste0(pc1," (",pca_perc[pc1n],"%)"), y=paste0(pc2," (",pca_perc[pc2n],"%)")) +
+    scale_color_manual(values = cl.colors) + 
+    scale_shape_manual(values = cl.shape) +
+     theme(text = element_text(size = 8),  
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black")) + 
+    facet_grid(cols = vars(eval(parse(text=facet))))
+  print(plt.obj)
+  pltnm <- paste0("Plots/Fig2/Supp_Fig6_neuts_subset_pseudobulk_PCA_cond-time_shapes_facet-", facet,"-maintype_",pc1,"-",pc2,".svg")
+  # ggsave(pltnm, width = 5, height = 2) # Cond
+  ggsave(pltnm,width = 6.45, height = 2) # Time
+}
+
+PCs <- paste0(rep("PC", 6), seq(1,6,1))
+for (j in seq(3,6,1)){
+  i = 1
+  pc1 = PCs[i]
+  pc2 = PCs[j]
+  #plot.pc.cond.time(df_pca.tbl, facet = "Condition", pc1 = pc1, pc2 = pc2, pc1n = i, pc2n = j)
+  plot.pc.cond.time(df_pca.tbl, facet = "Timepoint", pc1 = pc1, pc2 = pc2, pc1n = i, pc2n = j)
+}
+```
+
+```{r Supp. Fig. 7 functional annotation for PC loading genes}
+# convert gene symbol to entrez gene ID
+convert_entrez <- function(genes, nm){
+  ids <- bitr(rownames(genes), fromType = "ALIAS", toType = "ENTREZID", OrgDb = organism)
+  out.nm <- paste0("Plots/Fig2/PC_genes/",nm,"_EntrezID.csv")
+  colnames(ids) <- c("ALIAS", nm)
+  write.table(ids, file = out.nm, sep = ",", row.names = FALSE)
+}
+
+for (pc in PCs){
+  Genes_posi <- data.frame(sort(pca$rotation[,pc], decreasing=TRUE)[1:500])
+  Genes_neg <- data.frame(sort(pca$rotation[,pc], decreasing=FALSE)[1:500])
+  
+  convert_entrez(Genes_posi, paste0(pc, "genes_posi"))
+  convert_entrez(Genes_neg, paste0(pc,"genes_neg"))
+}
+# run outputs in Metascape
+
+# visualize GO term enrichment
+## load enrichment data 
+xl_data <- "Plots/Fig2/PC_genes/Neuts_PC_loading_enriched_terms.xlsx"
+tab_names <- excel_sheets(path = xl_data)
+list_all <- lapply(tab_names, function(x) read_excel(path = xl_data, sheet = x, range = cell_cols("N:O")))
+names(list_all) <- tab_names
+
+## plot each tab
+for (tab in tab_names){
+  data <- list_all[[tab]]
+  colnames(data) <- c("Description","Value")
+  p<-ggplot(data, aes(x = reorder(Description, Value), y=Value)) +
+    geom_bar(stat="identity")
+  # Horizontal bar plot
+  p <- p + coord_flip() + ylab("-log10(P)") + 
+    theme(text = element_text(size = 8), 
+          axis.title.y = element_blank(),
+          axis.text.x = element_text(color = "black", size = 8),
+          axis.text.y = element_text(color = "black", size = 8))
+  pltnm <- paste0("Plots/Fig2/Supp_Fig7_neuts",
+                  tab, "_wScalePCA_asFish_bar.svg")
+  print(p)
+  ggsave(filename = pltnm,
+         width = 3.2, height = 2.5, dpi = 300)
+}
+
+```
+
+```{r Fig. 2C GSEGO}
+# Define a function for making a ranked gene list (from wilcoxauc)
+make_ranked_gene_list <- function(genesets, clnm){
+   genes <- genesets %>%
+  dplyr::filter(group == clnm) %>%
+  arrange(desc(logFC)) %>% 
+  dplyr::select(feature, logFC)
+  ranks<- tibble::deframe(genes)
+  return(ranks)
+}
+
+# create a total gene list of lists
+Idents(neuts) <- "Identity"
+neuts.genes <- wilcoxauc(neuts, 'Identity')
+
+neut3.genelist <- make_ranked_gene_list(neuts.genes, "Precursor-like_Neuts")
+neut4.genelist <- make_ranked_gene_list(neuts.genes, "Immature_Neuts")
+neut5.genelist <- make_ranked_gene_list(neuts.genes, "il6r_padi2_Neuts")
+neut7.genelist <- make_ranked_gene_list(neuts.genes, "Mature_Neuts")
+total.ranks <- list(Precursorlike_Neuts = neut3.genelist, 
+                    Immature_Neuts = neut4.genelist, 
+                    il6r_padi2_Neuts = neut5.genelist,
+                    Mature_Neuts = neut7.genelist)
+
+# perform gseGO on the list of lists
+# clusterprofiler version 4.6.2
+## Updating min-max from 3-800 to 15-500 [default in GSEA]
+gsecp <- compareCluster(geneClusters = total.ranks, fun = gseGO, ont ="ALL", 
+                         keyType = "ALIAS", 
+                         nPerm = 10000, 
+                         minGSSize = 15, 
+                         maxGSSize = 500, 
+                         pvalueCutoff = 0.05, 
+                         verbose = TRUE, 
+                         OrgDb = organism, 
+                         pAdjustMethod = "none")
+dotplot(gsecp, showCategory=5, split=".sign", font.size = 8, label_format = 60) +
+  facet_grid(.~.sign) + 
+  ggtitle("Top5 GSE GO in neutrophil subsets") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  scale_size_area(max_size = 4) +
+  scale_color_gradient(high = "#56B1F7", low = "#132B43")
+ggsave("Plots/Fig2/Fig2C_gseGO_15-500_Neuts_bg_all_neuts_dotplot.svg", width = 5, height = 4.6)
+
+saveRDS(gsecp, file = "Plots/Fig2/Fig2C_gseGO_15-500_Neuts_bg_all_neuts_gsecp.rds")
+```
+```{r Fig. 2C GSEGO associated gene expression}
+# filter by enrichment score (positives are activated side, negatives are suppressed side)
+# obtain all IDs -> dedup -> extract from gsecp@compareClusterResults 
+# group by clusters, extract genes associated with the terms, calc average expression, calc z-score (pseudocounts for zero)
+gsecp@compareClusterResult %>% dplyr::select(Cluster, ID, Description, p.adjust, qvalue, enrichmentScore, rank,core_enrichment) %>% filter(enrichmentScore > 0) %>% group_by(Cluster)  %>% slice_min(p.adjust, n = 5) %>% dplyr::select(Cluster, ID, Description) -> activated.terms
+
+gsecp@compareClusterResult %>% dplyr::select(Cluster, ID, Description, p.adjust, qvalue, enrichmentScore, rank,core_enrichment) %>% filter(enrichmentScore < 0) %>% group_by(Cluster)  %>% slice_min(p.adjust, n = 5) %>% dplyr::select(Cluster, ID, Description) -> suppressed.terms
+
+# Concatenate both activated and suppressed terms 
+GO.terms.list <- rbind(activated.terms, suppressed.terms) %>% ungroup() %>% dplyr::select(ID, Description) %>% unique()
+
+# Match with top5 term plot (remove Oxygen binding)
+GO.terms.list <- GO.terms.list[-15,]
+
+# Extract gene list from gsecp
+GO.genes <- left_join(GO.terms.list, gsecp@compareClusterResult, by = "ID") %>%
+  mutate(ID_Cluster = paste(ID, Cluster, sep = ";"))
+# Create a list of genes for each GO terms
+genes.each.GO <- list()
+for (RN in 1:nrow(GO.genes)) {
+ temp <- strsplit(GO.genes[RN,]$core_enrichment, split = "/")
+ genes.each.GO[[RN]] <- temp[[1]]
+}
+names(genes.each.GO) <- GO.genes$ID_Cluster
+
+# Obtain average expression of all genes by cluster by conditions (abbreviation)
+## Subset each cell type
+Idents(neuts) <- "Identity"
+each_celltype_list <- list()
+each_celltype <- c("Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts")
+for (RN in each_celltype) {
+  each_celltype_list[[RN]] <- subset(neuts , idents = RN)
+}
+names(each_celltype_list) <- each_celltype
+
+# Calc avg exp within each cell type
+Avg_expression_list <- list()
+for (RN in 1:length(each_celltype_list)) {
+  Idents(each_celltype_list[[RN]]) <- "abbreviation"
+  Avg_expression_list[[RN]] <- AverageExpression(each_celltype_list[[RN]] , 
+                                                 assays = "RNA" , slot = "data")
+  Avg_expression_list[[RN]] <- as.data.frame(log1p(Avg_expression_list[[RN]]$RNA)) # natural log to match "data"
+}
+names(Avg_expression_list) <- names(each_celltype_list)
+
+# Calculate the mean value of each gene from all cells
+exp_matrix <- GetAssayData(neuts , slot = "data" , assay = "RNA") %>% 
+  data.frame() %>% rownames_to_column()
+rownames(exp_matrix) <- exp_matrix$rowname
+exp_matrix$rowname <- NULL
+exp_matrix$Mean <- rowMeans(exp_matrix)
+exp_matrix$Gene <- rownames(exp_matrix)
+Mean_all_cells <- exp_matrix[c("Gene" , "Mean")]
+
+# Extract avg expression
+Avg.expression.each.GO <- list()
+temp_list <- list()
+for (RN in 1:length(Avg_expression_list)) {
+ for (JA in 1:length(genes.each.GO)) {
+  temp_list[[JA]] <- Avg_expression_list[[RN]][rownames(Avg_expression_list[[RN]]) %in% genes.each.GO[[JA]],]
+  names(temp_list)[[JA]] <- names(genes.each.GO)[[JA]]
+ }
+Avg.expression.each.GO[[RN]] <- temp_list
+}
+names(Avg.expression.each.GO) <- names(Avg_expression_list)
+
+# Normalize each gene by adding a pseudocount of 1, and divide by mean value from all cells.
+Avg.expression.each.GO.norm <- list()
+for (RN in 1:length(Avg.expression.each.GO)) {
+ temp <- Avg.expression.each.GO[[RN]]
+ for (JA in 1:length(temp)) {
+  temp_1 <- Mean_all_cells[Mean_all_cells$Gene %in% rownames(temp[[JA]]),]
+  temp_1
+  temp[[JA]] <- (temp[[JA]] + 1) / (temp_1$Mean + 1)
+ }
+ Avg.expression.each.GO.norm[[RN]] <- temp
+}
+
+names(Avg.expression.each.GO.norm) <- names(Avg_expression_list)
+
+# Sum
+Sum_avg_expression_each_GO <- list()
+for (RN in 1:length(Avg.expression.each.GO.norm)) {
+ temp <- Avg.expression.each.GO.norm[[RN]]
+ for (JA in 1:length(temp)) {
+  temp[[JA]][names(Avg.expression.each.GO.norm[RN]),] <- colSums(temp[[JA]])
+ }
+ Sum_avg_expression_each_GO[[RN]] <- temp
+}
+names(Sum_avg_expression_each_GO) <- names(Avg.expression.each.GO.norm)
+
+# Create list of summation each GO:BP in each cell type
+Sum_exp_each_GO_celltype <- list()
+for (RN in 1:length(genes.each.GO)) {
+ Sum_exp_each_GO_celltype[[RN]] <- rbind(
+   tail(Sum_avg_expression_each_GO[[1]][[RN]], 1),
+   tail(Sum_avg_expression_each_GO[[2]][[RN]], 1),
+   tail(Sum_avg_expression_each_GO[[3]][[RN]], 1),
+   tail(Sum_avg_expression_each_GO[[4]][[RN]], 1))
+}
+names(Sum_exp_each_GO_celltype) <- names(genes.each.GO)
+
+# Create a big dataframe, each row represents each GO:BP, and each column represents each cell type in each condition.
+# matrix_size = 1 : (no_of_cell_types x biological_conditions)
+no_cell_types <- 4
+no_samples <- 6
+matrix_size <- no_cell_types*no_samples
+Input_dot_plot <- as.data.frame(matrix(1:matrix_size, nrow = 1, 
+                                       ncol = matrix_size))
+colnames(Input_dot_plot) <- c(paste("Precursor-like_Neuts" , names(Sum_exp_each_GO_celltype[[1]])),
+                              paste("Immature_Neuts" , names(Sum_exp_each_GO_celltype[[1]])) , 
+                              paste("il6r_padi2_Neuts" , names(Sum_exp_each_GO_celltype[[1]])) , 
+                              paste("Mature_Neuts" , names(Sum_exp_each_GO_celltype[[1]])))
+for (RN in 1:length(genes.each.GO)) {
+ temp <- Sum_exp_each_GO_celltype[[RN]]
+ temp <- cbind(temp[1,], temp[2,], temp[3,], temp[4,])
+ colnames(temp) <- colnames(Input_dot_plot)
+ Input_dot_plot <- rbind(Input_dot_plot , temp)
+}
+
+Input_dot_plot <- Input_dot_plot[-1,]
+rownames(Input_dot_plot) <- names(genes.each.GO)
+
+# calculate z-score by row
+Input_dot_plot_zscore <- t(apply((Input_dot_plot[,1:length(Input_dot_plot)]), 1, function(x){
+ mean <- mean(x)
+ SD <- sd(x)
+ Z_score <- (x-mean)/SD
+ Z_score
+}))
+
+Input_dot_plot_zscore <- as.data.frame(Input_dot_plot_zscore)
+
+# Convert long format
+forplot <- gather(Input_dot_plot_zscore %>% 
+                    rownames_to_column("GO"), key = "meta" , value = "Expression" , -GO)
+
+forplot <- 
+  forplot %>% 
+  separate(col = "GO", into = c("ID", "CellType1"), sep = ";", remove = T) %>%
+  separate(col = "meta",into = c("CellType2" , "Abbr"), sep = " " , remove = T) %>%
+  separate(col = "Abbr",into = c("Cond","Time"), sep = "_", remove = F) %>%
+  mutate(Condition = case_when(Cond %in% "U" ~ "Unwounded", Cond %in% "B" ~ "Burn")) %>%
+  mutate(Timepoint = case_when(Time %in% c("03dpf","06hpb") ~ "T1", Time %in% c("04dpf","24hpb") ~ "T2", Time %in% c("05dpf","48hpb") ~ "T3")) %>% 
+  mutate(CellType1 = replace(CellType1, CellType1 == "Precursorlike_Neuts","Precursor-like_Neuts")) %>%   filter(CellType1==CellType2) 
+
+forplot$Timepoint <- factor(forplot$Timepoint , levels = c("T1","T2","T3"))
+forplot$Condition <- factor(forplot$Condition , levels = c("Burn","Unwounded"))
+forplot$CellType1 <- factor(forplot$CellType1 , 
+                             levels = c("Precursor-like_Neuts","Immature_Neuts",
+                                        "il6r_padi2_Neuts","Mature_Neuts"))
+
+# Add GOterm descriptions back 
+forplot <- left_join(forplot,  GO.terms.list, by = "ID")
+forplot$Description <- factor(forplot$Description, levels = rev(c("ribonucleoprotein complex","peptide biosynthetic process","translation","ribonucleoprotein complex biogenesis", "organelle inner membrane", "ribosome","collagen catabolic process","complement activation","lymphocyte mediated immunity","steroid metabolic process","cell-matrix adhesion","negative regulation of cell population proliferation","steroid biosynthetic process","skeletal muscle contraction","sterol metabolic process","G protein-coupled amine receptor activity","regulation of immune system process","protein autophosphorylation","amide transport","response to estradiol","oxygen carrier activity","taxis","actin binding", "actin filament organization","neuropeptide signaling pathway","immunoglobulin complex","3',5'-cyclic-nucleotide phosphodiesterase activity")))
+
+# Visualize
+ggplot(forplot, aes(x=Timepoint, y=Description , color= Expression)) + 
+  geom_point(alpha = 1.5) + theme_classic() + 
+  scale_colour_gradient2( low = "blue", mid = "white", high = "red", space = "Lab" , 
+                          limits = c(-max(forplot$Expression),max(forplot$Expression)) ) + 
+  xlab("") + scale_size_continuous(range = c(5,5)) + 
+  #facet_grid(~Cell_Types+Cond , scales = "free", space = "free") + 
+  facet_nested(~CellType1+Cond) +
+  labs(color = paste("z-score")) + 
+  theme(axis.text.x = element_text(angle = 60, hjust=1), 
+        axis.text=element_text(size=8) , 
+        axis.title.y = element_text(size=8), 
+        strip.background = element_rect(colour = "white", fill = c("gray","darkorange3", "gray")), 
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8),
+        legend.key.size = unit(0.5, "cm"),
+        panel.spacing.x = unit(0, 'lines')) + 
+  ylab("Significant GO terms") 
+ggsave("Plots/Fig2/Fig2C_neuts_DEG_gseGO_aveExp_celltype_byCondTimepoint_dotplot.svg", 
+       width = 6.1, height = 3.82)
+```
+
+## Figure 3
+```{r Fig. 3A slingshot-based trajectory}
+Idents(neuts.sub) <- "Identity"
+rd <- neuts.sub@reductions$umap@cell.embeddings
+cl <- neuts.sub@active.ident
+## Number of clusters
+numCl <- length(unique(cl)) 
+sds <- slingshot(rd, cl) 
+
+# prep input for plotting
+df <- data.frame(rd, "cl" = as.character(cl))
+df$cl <- factor(df$cl, levels = c("Precursor-like_Neuts","Immature_Neuts",
+                                        "il6r_padi2_Neuts","Mature_Neuts"))
+## Number of curves
+numCurves <- length(sds@metadata$curves) 
+curves <- slingCurves(sds, as.df = TRUE)
+
+# Plot in ggplot2 style
+ggplot(df, aes(x = UMAP_1, y = UMAP_2)) + 
+  geom_point(aes(col = cl), shape = 16, size = 1) + 
+  scale_color_manual(values = cl.colors) + 
+  geom_path(data = curves %>% arrange(Order),
+            aes(group = Lineage), linewidth = 1) + 
+  theme_classic() + 
+  theme(aspect.ratio = 1.5, text = element_text(size = 8), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig3/Fig3A_Neuts_outlierrm_withSlingShotPT.svg", 
+    width = 3.2, 
+    height = 2.8)
+```
+
+```{r Supp. Fig. 8A monocle-based trajectory}
+# Load data from cellranger output 
+sample.list <- c("B_06hpb","B_24hpb","B_48hpb","U_03dpf","U_04dpf","U_05dpf")
+cds.list <- list()
+
+for (samp in sample.list){
+  mtx <- paste0("10xMatrices/", samp, "/matrix.mtx.gz")
+  fts <- paste0("10xMatrices/", samp, "/features.tsv.gz")
+  cells <- paste0("10xMatrices/", samp, "/barcodes.tsv.gz")
+  cds.temp <- load_mm_data(mat_path = mtx, feature_anno_path = fts, cell_anno_path = cells,
+                           feature_metadata_column_names=c('gene_short_name','type'))
+  cds.list[[samp]] <- cds.temp
+}
+
+# combine cds objects
+cds <- combine_cds(cds_list = cds.list)
+
+# preprocessing
+cds <- preprocess_cds(cds, num_dim = 50)
+
+# reduce dimensions
+cds <- reduce_dimension(cds)
+
+# cluster cells
+cds <- cluster_cells(cds)
+
+# map metadata with burn
+## Add sample stage/condition in place of sample
+current.clid <- sample.list 
+new.clid <-  c("Burn_6hpb","Burn_24hpb","Burn_48hpb","Unwounded_3dpf","Unwounded_4dpf","Unwounded_5dpf")
+cds@colData[["samplename"]] <- plyr::mapvalues(x = cds@colData$sample, from = current.clid, to = new.clid)
+## Match barcode format with seurat object
+cds@colData[["cellname"]] <- paste(cds@colData$samplename, cds@colData$cell, sep = "_")
+## Extract identity data from seurat
+burn@meta.data %>% tibble::rownames_to_column(var = "cellname") %>% dplyr::select(cellname, Identity, nCount_RNA) %>% data.frame() -> burn.meta 
+cdsmeta <- data.frame(cds@colData)
+joined.meta <- left_join(cdsmeta, burn.meta, by = "cellname") 
+cds@colData[["Identity"]] <- joined.meta$Identity
+
+# Perform this immediately after cluster step 
+cds.neuts <- choose_cells(cds)
+
+# learn graph
+cds.neuts <- cluster_cells(cds.neuts)
+cds.neuts <- learn_graph(cds.neuts)
+
+# Match identity
+cds.neuts <- order_cells(cds.neuts)
+
+# Plot trajectory for neuts
+plot_cells(cds.neuts,
+           color_cells_by = "Identity", trajectory_graph_color = "red",
+           label_cell_groups = FALSE,
+           label_branch_points = FALSE,
+           group_label_size = 3
+           ) + 
+  scale_color_manual(values = cl.colors, na.value = "lightgrey") +
+  theme(axis.title.x = element_text(size = 8), 
+        axis.text=element_text(size=8) , 
+        axis.title.y = element_text(size=8), 
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8),
+        legend.key.size = unit(0.5, "cm"),
+        panel.spacing.x = unit(0, 'lines'))
+ggsave("Plots/Fig3/Supp_Fig8A_monocle3_neuts_trajectory.svg",
+       width = 4.12, height = 2.2, dpi = 300)
+
+# Plot pseudotime for neuts
+plot_cells(cds.neuts,
+           color_cells_by = "pseudotime", trajectory_graph_color = "black",
+           label_cell_groups = FALSE,
+           label_branch_points = FALSE,
+           group_label_size = 3
+           ) +
+  theme(axis.title.x = element_text(size = 8), 
+        axis.text=element_text(size=8) , 
+        axis.title.y = element_text(size=8), 
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8),
+        legend.key.size = unit(0.5, "cm"),
+        panel.spacing.x = unit(0, 'lines'))
+ggsave("Plots/Fig3/Supp_Fig8A_monocle3_neuts_trajectory_col-pt.svg",
+       width = 3.4, height = 2.2, dpi = 300)
+```
+
+```{r Supp. Fig. 8B neutrophil maturation marker}
+# Feature plot for lyz and mmp9 in neutrophil only
+DefaultAssay(neuts.sub) <- "RNA"
+FeaturePlot(neuts.sub, features = c("lyz","mmp9")) &
+  theme(text = element_text(size = 8), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig3/Supp_Fig8B_burn_neuts_lyz_mmp9_ftplt.svg",
+       width = 4, height = 2.2)
+```
+
+```{r Supp. Fig. 8C homolog expression of il6r_padi2_neuts signatures in human}
+DefaultAssay(Montaldo_downsample) <- "RNA"
+VlnPlot(Montaldo_downsample, 
+        features = c("LYZ","MPO","IL6R","PADI2","MMP9"),
+        group.by = "stage", fill.by = "ident",
+        stack = TRUE, flip = TRUE) +
+  theme(text = element_text(size = 8), axis.text.x =element_text(size = 8))
+ggsave("Plots/Fig3/Supp_Fig8C_padi2_cluster_marker_montaldo_human_vlnplt.svg", 
+       width = 3, height = 2.4, dpi = 300)
+```
+
+```{r Fig. 3B RNA velocity; Supp. Fig. 8D}
+# velocyto (command line) 
+## samtools sort v1.16.1, with parameters "-@ 8 -m 4G -t CB -O BAM". Presort to reduce memory requirement in the velocyto step.
+## velocyto run10x v0.17.17, with parameters "-m zv11_rmsk.gtf $CellrangerOutputFolder GRCz11_v4.3.2/genes/genes.gtf". Output as loom files in the cellranger output folder.
+
+# Prepare seurat object for scVelo
+out_data_dir <- "Plots/Fig3/CellRanks/"
+neuts.sub$barcode <- colnames(neuts.sub)
+neuts.sub$UMAP_1 <- neuts.sub@reductions$umap@cell.embeddings[,1]
+neuts.sub$UMAP_2 <- neuts.sub@reductions$umap@cell.embeddings[,2]
+write.csv(neuts.sub@meta.data, file=paste0(out_data_dir, "burn_neuts_metadata.csv"), quote=F, row.names=F)
+
+# Save expression count matrix
+counts_matrix <- GetAssayData(neuts.sub, assay='RNA', slot='counts')
+writeMM(counts_matrix, file=paste0(out_data_dir, "burn_neuts_counts.mtx"))
+
+# Save dimensionality reduction 
+write.csv(neuts.sub@reductions$pca@cell.embeddings, file=paste0(out_data_dir,"burn_neuts_pca.csv"), quote=F, row.names=F)
+
+# Write gene names
+write.table(
+  data.frame('gene'=rownames(counts_matrix)),file=paste0(out_data_dir,"burn_neuts_gene_names.csv"),
+  quote=F,row.names=F,col.names=F
+)
+
+# scVelocyto processing see zebrafish_burn_scRNA_neutrophil_scVelo.ipynb 
+```
+
+```{r Fig. 3C celloracle - preparation}
+# data preparation 
+## remove scale.data 
+DefaultAssay(burn) <- "RNA"
+burn.diet <- DietSeurat(
+  burn,
+  counts = TRUE,
+  data = TRUE,
+  scale.data = FALSE,
+  features = NULL,
+  assays = NULL,
+  dimreducs = c("pca","umap"),
+  graphs = NULL,
+  misc = TRUE
+)
+## add metadata to save condition, time, and cluster info as one identity
+burn.diet[["condition.cl"]] <- paste(burn.diet$Condition, burn.diet$Identity, sep = "-")
+burn.diet[["cond.time.cl"]] <- paste(burn.diet$abbreviation, burn.diet$Identity, sep = "-")
+
+## factor to character, or else your factor will be number in adata 
+i <- sapply(burn.diet@meta.data, is.factor)
+burn.diet@meta.data[i] <- lapply(burn.diet@meta.data[i], as.character)
+
+## save as h5seurat, then convert to h5ad 
+SaveH5Seurat(burn.diet, filename = "RDS/Zebrafish_Neut_Mac_Harmony_Burn_Unwounded_Seurat_diet_cond-time_meta.h5seurat")
+Convert("RDS/Zebrafish_Neut_Mac_Harmony_Burn_Unwounded_Seurat_diet_cond-time_meta.h5seurat", dest = "h5ad")
+
+# GRN analysis with zebrafish_burn_scRNA_neutrophil_celloracle.ipynb 
+```
+
+```{r Supp. Fig. 9A celloracle - TF comparison}
+# set up empty list to save TF links for each cell cluster
+TF.list <- list()
+current.clid <- c("ccl34a.4_Macs","lgals3bpb_Mac1","lgals3bpb_Mac2","cx43_Macs","Cycling_Mac1","Cycling_Mac2","Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts")
+name.list <- paste(c(rep("Burn", 10), rep("Unwounded", 10)), rep(current.clid, 2), sep = "-")
+abbr.list <- c("B_M1","B_M2","B_M3","B_M4","B_M5","B_M6","B_N1","B_N2","B_N3","B_N4",
+               "U_M1","U_M2","U_M3","U_M4","U_M5","U_M6","U_N1","U_N2","U_N3","U_N4")
+
+# Extract TFs (cond genes)
+for (i in seq(1,20,1)){
+  file.nm <- paste0("Plots/Fig3/CellOracle/genes/",name.list[[i]],"_all_genes.csv")
+  network.tfs <- read.csv(file = file.nm, header = TRUE)
+  nw.tf.df <- data.frame(network.tfs$X, network.tfs$degree_centrality_all)
+  colnames(nw.tf.df) <- c("gene",abbr.list[[i]])
+  TF.list[[i]] <- nw.tf.df
+}
+names(TF.list) <- name.list
+
+# join all lists by gene
+joined <- TF.list %>% purrr::reduce(full_join, by = "gene")
+## gene to rowname
+rownames(joined) <- joined$gene
+joined$gene <- NULL
+## create mtx and turn NA to 0
+joined.mtx <- as.matrix(joined)
+joined.mtx[is.na(joined.mtx)] <- 0
+
+# load metadata 
+anndata <- read.csv("Plots/Fig3/CellOracle/subset_meta.csv", header = TRUE)
+ann <- data.frame(anndata, row.names = anndata$X) %>% 
+  dplyr::select(Condition, Type, Name)
+
+## align metadata and matrix orders
+ann <-ann[colnames(joined.mtx), ]
+
+# set heatmap parameters
+ann.col <- list("Condition" = c("Burn" = "red2", "Unwounded" = "royalblue"),
+                "Type" = c("Neutrophil" = "gold", "Macrophage" = "limegreen"),
+                "Name" = c("Precursor-like_Neuts" = "#666666", 
+                           "Immature_Neuts" = "#AD7700",
+                           "il6r_padi2_Neuts" = "#1C91D4",
+                           "Mature_Neuts" = "#007756",
+                           "ccl34a.4_Macs" = "#E69F00",
+                           "lgals3bpb_Mac1" = "#56B4E9",
+                           "lgals3bpb_Mac2" = "#009E73",
+                           "cx43_Macs" = "#F0E442",
+                           "Cycling_Mac1" = "#0072B2",
+                           "Cycling_Mac2" = "#D55E00"))
+
+colAnn <- HeatmapAnnotation(df = ann,
+                            annotation_legend_param = list("Condition" = list(at = c("Burn","Unwounded")),
+                                                           "Type" = list(title = "Main Type", 
+                                                                         at = c("Neutrophil","Macrophage")),
+                                                           "Name" = list(title = "Subset",
+                                                                         at = c("Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts",
+                           "ccl34a.4_Macs","lgals3bpb_Mac1","lgals3bpb_Mac2",
+                           "cx43_Macs","Cycling_Mac1","Cycling_Mac2")
+                                                                    )),
+                            which = 'col',
+                            col = ann.col,
+                            annotation_width = unit(2, 'inch'), 
+                            annotation_height = unit(4, 'mm'),
+                            gap = unit(1, 'mm'),
+                            annotation_name_gp = gpar(fontsize = 8)
+                            )
+
+col_fun = colorRamp2(c(0, 0.2, 0.4), c("white","orange","red"))
+
+ht <- Heatmap(joined.mtx, name = "degree centrality all", 
+        col = col_fun,
+        cluster_rows = TRUE, cluster_columns = TRUE, 
+        row_names_side = "left",
+        width = unit(1, 'cm'),
+        top_annotation = colAnn)
+ht <- draw(ht, heatmap_legend_side = "left", annotation_legend_side = "right")
+
+## Obtain top 30 gene from heatmap 
+top30 <- head(row_order(ht), n = 30)
+top30.mtx <- joined.mtx[top30,]
+
+## adjust heatmap parameters
+ht_opt$heatmap_row_names_gp = gpar(fontsize = 8)
+ht_opt$legend_title_gp = gpar(fontsize = 8)
+ht_opt$legend_labels_gp = gpar(fontsize = 8)
+
+ht.t30 <- Heatmap(top30.mtx, name = "degree centrality all", 
+        col = col_fun,
+        #cluster_rows = TRUE, cluster_columns = TRUE, 
+        row_names_side = "left",
+        width = unit(2, 'inch'),
+        height = unit(3.6, 'inch'),
+        top_annotation = colAnn, show_column_names = FALSE
+        )
+svglite(filename = "Plots/Fig3/Supp_Fig9A_allTF_top30_neut_mac_byClust_byCond_heatmap.svg", 
+        width = 6, height = 5)
+ht.t30 <- draw(ht.t30, 
+               heatmap_legend_side = "left", annotation_legend_side = "right")
+dev.off()
+
+save(top30.mtx, ht.t30, file = "Plots/Fig3/CellOracle/top_TF_mtx.rda")
+```
+
+```{r Fig. 3C celloracle - TF comparison in neuts}
+# subset TF list to contain neutrophil only
+current.clid <- c("Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts")
+name.list <- paste(c(rep("Burn", 4), rep("Unwounded", 4)), rep(current.clid, 2), sep = "-")
+TF.neuts.list <- TF.list[name.list]
+
+# join all lists by gene
+joined <- TF.neuts.list %>% purrr::reduce(full_join, by = "gene")
+## gene to rowname
+rownames(joined) <- joined$gene
+joined$gene <- NULL
+## create mtx and turn NA to 0
+joined.mtx <- as.matrix(joined)
+joined.mtx[is.na(joined.mtx)] <- 0
+
+# load metadata 
+anndata <- read.csv("Plots/Fig3/CellOracle/subset_neuts_meta.csv", header = TRUE)
+ann <- data.frame(anndata, row.names = anndata$X) %>% 
+  dplyr::select(Condition, Name)
+
+## align metadata and matrix orders
+ann <-ann[colnames(joined.mtx), ]
+
+# set heatmap parameters
+ann.col <- list("Condition" = c("Burn" = "red2", "Unwounded" = "royalblue"),
+                "Name" = c("Precursor-like_Neuts" = "#666666", 
+                           "Immature_Neuts" = "#AD7700",
+                           "il6r_padi2_Neuts" = "#1C91D4",
+                           "Mature_Neuts" = "#007756"
+                           ))
+
+colAnn <- HeatmapAnnotation(df = ann,
+                            annotation_legend_param = list("Condition" = list(at = c("Burn","Unwounded")),
+                                                        
+                                                           "Name" = list(title = "Subset",
+                                                                         at = c("Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts"
+                                                                                )
+                                                           )),
+                            which = 'col',
+                            col = ann.col,
+                            annotation_width = unit(2, 'inch'), 
+                            annotation_height = unit(4, 'mm'),
+                            gap = unit(1, 'mm'),
+                            annotation_name_gp = gpar(fontsize = 8))
+
+col_fun = colorRamp2(c(0, 0.2, 0.4), c("white","orange","red"))
+
+ht <- Heatmap(joined.mtx, name = "degree centrality all", 
+              col = col_fun,
+              cluster_rows = TRUE, cluster_columns = TRUE, 
+              row_names_side = "left",
+              width = unit(1, 'cm'),
+              top_annotation = colAnn)
+ht <- draw(ht, heatmap_legend_side = "left", annotation_legend_side = "right")
+
+## Obtain top 30 gene from heatmap 
+top30 <- head(row_order(ht), n = 30)
+### remove rpl13a due to no target gene expression captured in any sample 
+top30 <- head(top30, -1)
+top30.mtx <- joined.mtx[top30,]
+
+ht.t30 <- Heatmap(top30.mtx, name = "degree centrality all", 
+                  col = col_fun,
+                  #cluster_rows = TRUE, cluster_columns = TRUE, 
+                  row_names_side = "left",
+                  width = unit(1.5, 'inch'),
+                  height = unit(3.6, 'inch'),
+                  top_annotation = colAnn, show_column_names = FALSE
+)
+svglite(filename = "Plots/Fig3/Fig3C_allTF_top30_neut_only_byClust_byCond_heatmap.svg", 
+        width = 6, height = 5)
+ht.t30 <- draw(ht.t30, 
+               heatmap_legend_side = "left", annotation_legend_side = "right")
+dev.off()
+
+# save row orders
+ht.roworders <- rownames(top30.mtx[row_order(ht.t30),])
+
+save(top30.mtx, ht.t30, file = "Plots/Fig3/CellOracle/top_neuts_TF_mtx.rda")
+```
+
+```{r Supp. Fig. 9B celloracle - individual cluster comparison}
+# Individual comparison
+TF.neuts.list %>% 
+  reduce(full_join, by = "gene") %>%
+  replace(is.na(.), 0) -> df.list
+
+df.list %>%
+  mutate(B_highlight = case_when((B_N4 - B_N3) > 0.1 ~ "N4",
+                                 (B_N4 - B_N3) < -0.1 ~ "N3",
+                                 TRUE ~ "bg")) %>% 
+  mutate(U_highlight = case_when((U_N4 - U_N3) > 0.1 ~ "N4",
+                                 (U_N4 - U_N3) < -0.1 ~ "N3",
+                                 TRUE ~ "bg")) -> df.list
+
+tf.col <- c("#1C91D4","#007756","grey")
+names(tf.col) <- c("N3","N4","bg") 
+
+# Visualize degree of centrality comparison between subsets 
+p1 <- ggplot(df.list, aes(x = B_N3, y = B_N4, label = gene)) +
+  geom_point(size = 1, aes(color=B_highlight)) +
+  xlim(c(0, 0.4)) + 
+  ylim(c(0, 0.4)) + 
+  xlab("Burn-il6r_padi2_Neuts") +
+  ylab("Burn-Mature_Neuts") +
+  theme_minimal(base_size = 8) +
+  geom_text_repel(
+    data = subset(df.list, B_highlight != "bg"),
+    aes(color = B_highlight),
+    size = 3
+  ) +
+  scale_color_manual(values = c("grey","#1C91D4","#007756"))
+
+p2 <- ggplot(df.list, aes(x = U_N3, y = U_N4, label = gene)) +
+  geom_point(size = 1, aes(color=U_highlight)) +
+  xlim(c(0, 0.4)) + 
+  ylim(c(0, 0.4)) + 
+  xlab("Unwounded-il6r_padi2_Neuts") +
+  ylab("Unwounded-Mature_Neuts") +
+  theme_minimal(base_size = 8) +
+  geom_text_repel(
+    data = subset(df.list, U_highlight != "bg"),
+    aes(color = U_highlight),
+    size = 3
+  ) +
+  scale_color_manual(values = c("grey","#1C91D4","#007756"))
+
+p1 / p2
+ggsave("Plots/Fig3/Supp_Fig8B_allTF_neut_only_byClust_byCond_comparison.svg",
+       width = 3.2, height = 4.6)
+```
+
+```{r Fig. 3C celloracle - TF target expression}
+# Focus on the top 30 TFs used in the heatmap
+TFs <- rownames(top30.mtx) 
+# Extract list of target genes for each TF under each condition in each subset (cond.time links)
+cond.abbr <- c("U_03dpf", "U_04dpf", "U_05dpf", "B_06hpb", "B_24hpb", "B_48hpb")
+cl.list <- c("Precursor-like_Neuts","Immature_Neuts","il6r_padi2_Neuts","Mature_Neuts")
+targets.each.TF <- list()
+temp_list <- list()
+for (cond in cond.abbr){
+  for (cl in cl.list){
+    cond.cl <- paste(cond, cl, sep = "-")
+    filepath <- paste0("Plots/Fig3/CellOracle/links/", cond,"-", cl, "_filtered_links.csv")
+    links <- read.csv(filepath, header = TRUE)
+    for (i in 1:length(TFs)){
+      temp_list[[i]] <- links[links$source == TFs[[i]],]$target
+      names(temp_list)[[i]] <- TFs[[i]]
+    }
+    targets.each.TF[[cond.cl]] <- temp_list
+  }
+}
+
+# Expression estimation 
+neuts[["cond.time.cl"]] <- paste(neuts$abbreviation, neuts$Identity, sep = "-")
+neuts[["cond.time.cl"]] <- factor(neuts$cond.time.cl, 
+                                  levels = c("U_03dpf-Precursor-like_Neuts","U_03dpf-Immature_Neuts","U_03dpf-il6r_padi2_Neuts",
+                                             "U_03dpf-Mature_Neuts","U_04dpf-Precursor-like_Neuts","U_04dpf-Immature_Neuts",
+                                             "U_04dpf-il6r_padi2_Neuts","U_04dpf-Mature_Neuts","U_05dpf-Precursor-like_Neuts",
+                                             "U_05dpf-Immature_Neuts","U_05dpf-il6r_padi2_Neuts","U_05dpf-Mature_Neuts",
+                                             "B_06hpb-Precursor-like_Neuts","B_06hpb-Immature_Neuts","B_06hpb-il6r_padi2_Neuts",
+                                             "B_06hpb-Mature_Neuts","B_24hpb-Precursor-like_Neuts","B_24hpb-Immature_Neuts",
+                                             "B_24hpb-il6r_padi2_Neuts","B_24hpb-Mature_Neuts","B_48hpb-Precursor-like_Neuts",
+                                             "B_48hpb-Immature_Neuts","B_48hpb-il6r_padi2_Neuts","B_48hpb-Mature_Neuts"))
+
+Idents(neuts) <- "cond.time.cl" 
+each_celltype_list <- list()
+each_celltype <- levels(Idents(neuts))
+for (RN in each_celltype) {
+  each_celltype_list[[RN]] <- subset(neuts , idents = RN)
+}
+names(each_celltype_list) <- each_celltype
+
+## Calc avg exp within each cell type
+Avg_expression_list <- list()
+for (RN in 1:length(each_celltype_list)) {
+  Idents(each_celltype_list[[RN]]) <- "abbreviation"
+  Avg_expression_list[[RN]] <- AverageExpression(each_celltype_list[[RN]] , 
+                                                 assays = "RNA" , slot = "data")
+  Avg_expression_list[[RN]] <- as.data.frame(log1p(Avg_expression_list[[RN]]$RNA)) # natural log to match "data"
+}
+names(Avg_expression_list) <- names(each_celltype_list)
+
+# Calculate the mean value of each gene from all cells [same as Fig2 gseGO]
+exp_matrix <- GetAssayData(neuts , slot = "data" , assay = "RNA") %>% 
+  data.frame() %>% rownames_to_column()
+rownames(exp_matrix) <- exp_matrix$rowname
+exp_matrix$rowname <- NULL
+exp_matrix$Mean <- rowMeans(exp_matrix)
+exp_matrix$Gene <- rownames(exp_matrix)
+Mean_all_cells <- exp_matrix[c("Gene" , "Mean")]
+
+# Extract avg expression for genes in each network
+Avg.expression.each.TFlist <- list()
+temp_list <- list()
+for (RN in names(Avg_expression_list)) {
+  current.tflist <- targets.each.TF[[RN]]
+ for (JA in names(current.tflist)) {
+  temp_list[[JA]] <- Avg_expression_list[[RN]][rownames(Avg_expression_list[[RN]]) %in% current.tflist[[JA]],]
+ }
+  names(temp_list[[JA]]) <- targets.each.TF[[RN]][[JA]]
+Avg.expression.each.TFlist[[RN]] <- temp_list
+}
+names(Avg.expression.each.TFlist) <- names(Avg_expression_list)
+
+# Normalize each gene by adding a pseudocount of 1, and divide by mean value from all cells. 
+Avg.expression.each.TFlist.norm <- list()
+for (RN in names(Avg.expression.each.TFlist)) {
+ temp <- Avg.expression.each.TFlist[[RN]]
+ current.tflist <- targets.each.TF[[RN]]
+ for (JA in names(temp)) {
+  temp_1 <- Mean_all_cells[Mean_all_cells$Gene %in% current.tflist[[JA]],]
+  temp_1
+  temp[[JA]] <- (temp[[JA]] + 1) / (temp_1$Mean + 1)
+ }
+ Avg.expression.each.TFlist.norm[[RN]] <- temp
+}
+
+# Sum
+Sum_avg_expression_each_TFlist <- list()
+for (RN in names(Avg.expression.each.TFlist.norm)) {
+ temp <- Avg.expression.each.TFlist.norm[[RN]]
+ for (JA in names(temp)) {
+  temp[[JA]] <- sum(temp[[JA]])
+ }
+ Sum_avg_expression_each_TFlist[[RN]] <- temp
+}
+
+# Create list of summation each GO:BP in each cell type
+Sum_exp_each_TFlist_cond_cl <- list()
+# text.cmd <- ""
+# for (JA in seq(1,24,1)){
+#   text.pt <- paste0("Sum_avg_expression_each_TFlist[[", JA, "]][[RN]],")
+#   text.cmd <- paste0(text.cmd, text.pt)
+# }
+
+for (RN in TFs) {
+ Sum_exp_each_TFlist_cond_cl[[RN]] <- rbind(
+   Sum_avg_expression_each_TFlist[[1]][[RN]],Sum_avg_expression_each_TFlist[[2]][[RN]],Sum_avg_expression_each_TFlist[[3]][[RN]],Sum_avg_expression_each_TFlist[[4]][[RN]],Sum_avg_expression_each_TFlist[[5]][[RN]],Sum_avg_expression_each_TFlist[[6]][[RN]],Sum_avg_expression_each_TFlist[[7]][[RN]],Sum_avg_expression_each_TFlist[[8]][[RN]],Sum_avg_expression_each_TFlist[[9]][[RN]],Sum_avg_expression_each_TFlist[[10]][[RN]],Sum_avg_expression_each_TFlist[[11]][[RN]],Sum_avg_expression_each_TFlist[[12]][[RN]],Sum_avg_expression_each_TFlist[[13]][[RN]],Sum_avg_expression_each_TFlist[[14]][[RN]],Sum_avg_expression_each_TFlist[[15]][[RN]],Sum_avg_expression_each_TFlist[[16]][[RN]],Sum_avg_expression_each_TFlist[[17]][[RN]],Sum_avg_expression_each_TFlist[[18]][[RN]],Sum_avg_expression_each_TFlist[[19]][[RN]],Sum_avg_expression_each_TFlist[[20]][[RN]],Sum_avg_expression_each_TFlist[[21]][[RN]],Sum_avg_expression_each_TFlist[[22]][[RN]],Sum_avg_expression_each_TFlist[[23]][[RN]],Sum_avg_expression_each_TFlist[[24]][[RN]]) # work on an alternative...
+}
+
+# Prepare matrix for plotting
+no_cell_types <- 4
+no_samples <- 6
+matrix_size <- no_cell_types*no_samples
+Input_dot_plot <- as.data.frame(matrix(1:matrix_size, nrow = 1, 
+                                       ncol = matrix_size))
+colnames(Input_dot_plot) <- names(targets.each.TF)
+for (RN in TFs) {
+ temp <- t(Sum_exp_each_TFlist_cond_cl[[RN]])
+ colnames(temp) <- colnames(Input_dot_plot)
+ Input_dot_plot <- rbind(Input_dot_plot , temp)
+}
+
+Input_dot_plot <- Input_dot_plot[-1,]
+rownames(Input_dot_plot) <- TFs
+
+# calculate z-score by row
+Input_dot_plot_zscore <- t(apply((Input_dot_plot[,1:length(Input_dot_plot)]), 1, function(x){
+ mean <- mean(x)
+ SD <- sd(x)
+ Z_score <- (x-mean)/SD
+ Z_score
+}))
+
+Input_dot_plot_zscore <- as.data.frame(Input_dot_plot_zscore)
+
+# Convert long format
+forplot <- gather(Input_dot_plot_zscore %>% 
+                    rownames_to_column("TF"), key = "cond.cl" , value = "Expression" , -TF)
+
+forplot <- 
+  forplot %>% 
+  separate(col = "cond.cl",into = c("Abbr" , "CellType2"), sep = "-" , remove = T) %>%
+  separate(col = "Abbr",into = c("Cond","Time"), sep = "_", remove = F) %>%
+  mutate(Condition = case_when(Cond %in% "U" ~ "Unwounded", Cond %in% "B" ~ "Burn")) %>%
+  mutate(Timepoint = case_when(Time %in% c("03dpf","06hpb") ~ "T1", Time %in% c("04dpf","24hpb") ~ "T2", Time %in% c("05dpf","48hpb") ~ "T3")) %>% 
+  mutate(CellType1 = case_when(CellType2 %in% "Precursor" ~ "Precursor-like_Neuts",
+                               CellType2 %in% "Immature_Neuts" ~ "Immature_Neuts",
+                               CellType2 %in% "il6r_padi2_Neuts" ~ "il6r_padi2_Neuts",
+                               CellType2 %in% "Mature_Neuts" ~ "Mature_Neuts"))
+
+forplot$Timepoint <- factor(forplot$Timepoint , levels = c("T1","T2","T3"))
+forplot$Condition <- factor(forplot$Condition , levels = c("Unwounded","Burn"))
+forplot$CellType1 <- factor(forplot$CellType1 , 
+                             levels = c("il6r_padi2_Neuts","Precursor-like_Neuts",
+                                        "Immature_Neuts","Mature_Neuts"))
+
+forplot$TF <- factor(forplot$TF, levels = rev(c(ht.roworders)))
+
+ggplot(forplot, aes(x=Timepoint, y=TF , color= Expression)) + 
+  geom_point(alpha = 1.5) + theme_classic() + 
+  scale_colour_gradient2( low = "blue", mid = "white", high = "red", space = "Lab" , 
+                          limits = c(-max(forplot$Expression),max(forplot$Expression)) ) + 
+  xlab("") + scale_size_continuous(range = c(5,5)) + 
+  #facet_grid(~Cell_Types+Cond , scales = "free", space = "free") + 
+  facet_nested(~CellType1+Cond) +
+  labs(color = paste("z-score")) + 
+  theme(axis.text.x = element_text(angle = 60, hjust=1), 
+        axis.text=element_text(size=8) , 
+        axis.title.y = element_text(size=8), 
+        strip.background = element_rect(colour = "white", fill = c("gray","darkorange3", "gray")), 
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8),
+        legend.key.size = unit(0.5, "cm"),
+        panel.spacing.x = unit(0, 'lines')) + 
+  ylab("TFs") 
+ggsave("Plots/Fig3/Fig3C_neuts_only_allTF_top30_TargetGeneAveExp_celltype_byCondTimepoint_scaled_dotplot.svg", 
+       width = 4.5, height = 4.65)
+```
+
+## Figure 4
+```{r Fig. 4 cellchat - preparations}
+# Define Functions for Modifying CellChatDB
+checkGeneSymbolExport <- function(geneSet, geneIfo){
+  geneSet <- unique(geneSet[geneSet !=""])
+  genes_notOfficial <- geneSet[geneSet %in% geneIfo$Symbol =="FALSE"]
+  if (length(genes_notOfficial) > 0) {
+    cat("Issue identified!! Please check the official Gene Symbol of the following genes:","\n", genes_notOfficial,"\n")
+  }
+  return(genes_notOfficial)
+}
+addInteraction <- function(interactionDF,geneInfoDF,ligand,receptor,pathway='filler'){
+  #Check if ligand and receptor are in geneInfoDF
+  if ((ligand %in% rownames(geneInfoDF)|(ligand %in% geneInfoDF$Symbol))){
+    print("Ligand in geneInfo")
+  } else{
+    geneInfoDF[nrow(geneInfoDF)+1,]<-c(str_to_sentence(ligand),ligand)
+    rownames(geneInfoDF)<-geneInfoDF$Symbol
+  }
+  if ((receptor %in% rownames(geneInfoDF)|(receptor %in% geneInfoDF$Symbol))){
+    print("Receptor in geneInfo")
+  } else{
+    geneInfoDF[nrow(geneInfoDF)+1,]<-c(str_to_sentence(receptor),receptor)
+    rownames(geneInfoDF)<-geneInfoDF$Symbol
+  }
+  interactionDF[nrow(interactionDF)+1,]<-c(toupper(paste(ligand,'_',receptor,sep = '')),pathway,ligand,receptor,NA,NA,NA,NA,NA,NA,paste(ligand,'_',receptor,sep = ''))
+  intnames<-rownames(interactionDF)
+  intnames[length(intnames)]<-toupper(paste(ligand,'_',receptor,sep = ''))
+  rownames(interactionDF)<-intnames
+  return(list(interactionDF,geneInfoDF))
+}
+```
+
+```{r Fig. 4 cellchat - modify database}
+# Modify CellChat Database
+dboi=CellChatDB.zebrafish
+itx<-dboi$interaction
+cpx<-dboi$complex
+cfx<-dboi$cofactor
+gi<-dboi$geneInfo
+
+cpx_remove<-checkGeneSymbolExport(unlist(cpx),gi)
+cfx_remove<-checkGeneSymbolExport(unlist(cfx),gi)
+cfx_filter<-cfx[(cfx$cofactor1 %in% cfx_remove | cfx$cofactor2 %in% cfx_remove | cfx$cofactor3 %in% cfx_remove | cfx$cofactor4 %in% cfx_remove| cfx$cofactor5 %in% cfx_remove)== 'FALSE',]
+cpx_filter<-cpx[(cpx$subunit_1 %in% cpx_remove | cpx$subunit_2 %in% cpx_remove) == 'FALSE',]
+allLR<-c(unique(itx$ligand),unique(itx$receptor))
+itx_remove<-checkGeneSymbolExport(allLR[allLR %in% rownames(cpx_filter)=="FALSE"],gi)
+itx_filter<-itx[(itx$ligand %in% itx_remove | itx$receptor %in% itx_remove)=='FALSE',]
+allLR2<-c(unique(itx_filter$ligand),unique(itx_filter$receptor))
+itx_remove<-checkGeneSymbolExport(allLR2[allLR2 %in% rownames(cpx_filter)=="FALSE"],gi)
+dboi$interaction<-itx_filter
+dboi$complex<-cpx_filter
+dboi$cofactor<-cfx_filter
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'il6','il6r','IL6')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'il4','il4r.1','IL4')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'il4','il4r.2','IL4')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'il12a','il12rb2','IL12')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'il12a','il12rb2l','IL12')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'il21','il21r.1','IL21')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'cxcl11.1','cxcr3.2','CXCL11')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'cxcl11.1','cxcr3.3','CXCL11')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'ccl35.1','ccr2','CCL35')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+
+x<-addInteraction(dboi$interaction,dboi$geneInfo,'ccl35.2','ccr2','CCL35')
+dboi$interaction<-x[[1]]
+dboi$geneInfo<-x[[2]]
+```
+
+```{r Fig. 4 cellchat - create cellchat object}
+sample.list <- SplitObject(burn,split.by = 'abbreviation')
+
+# create a list for cell chat objects
+cellchat_list <- list()
+for (name in names(sample.list)){
+  data.obj <- sample.list[[name]]
+  data.input <- GetAssayData(data.obj, assay = "RNA", slot = "data")
+  data.labels <- data.obj$Identity
+  data.meta <- data.frame(group = data.labels,
+                          row.names = colnames(data.obj))
+  cellchat_list[[name]] <- createCellChat(object = data.input, 
+                                          meta = data.meta, 
+                                          group.by = "group")
+}
+
+cellchat_list <- lapply(cellchat_list, function(cellchat){
+  cellchat@DB <- dboi
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat,thresh.p = 0.05)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- computeCommunProb(cellchat)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- filterCommunication(cellchat, min.cells = 5)
+  cellchat <- aggregateNet(cellchat)
+  cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+})
+names(cellchat_list)
+
+save(cellchat_list, file = "Plots/Fig4/cellchat_objects.rda")
+```
+
+```{r Fig. 4A Interaction count strength lollipops}
+#Construct barplots and line graph of changes in counts and strength across treatment and timepoint----
+#Create input tibble
+barplot_linegraph_count_strength<-tibble(interaction_count=c(sum(cellchat_list$U_03dpf@net$count),
+                           sum(cellchat_list$U_04dpf@net$count),
+                           sum(cellchat_list$U_05dpf@net$count),
+                           sum(cellchat_list$B_06hpb@net$count),
+                           sum(cellchat_list$B_24hpb@net$count),
+                           sum(cellchat_list$B_48hpb@net$count)),
+       interaction_strength=c(sum(cellchat_list$U_03dpf@net$weight),
+                              sum(cellchat_list$U_04dpf@net$weight),
+                              sum(cellchat_list$U_05dpf@net$weight),
+                              sum(cellchat_list$B_06hpb@net$weight),
+                              sum(cellchat_list$B_24hpb@net$weight),
+                              sum(cellchat_list$B_48hpb@net$weight)),
+       timepoint=rep(c('T1','T2','T3'),2),
+       condition=c(rep('Unwounded',3),rep('Burn',3)))
+barplot_linegraph_count_strength$count_FC=c(barplot_linegraph_count_strength$interaction_count[1:3]/barplot_linegraph_count_strength$interaction_count[1],
+                                            barplot_linegraph_count_strength$interaction_count[4:6]/barplot_linegraph_count_strength$interaction_count[4])
+barplot_linegraph_count_strength$strength_FC=c(barplot_linegraph_count_strength$interaction_strength[1:3]/barplot_linegraph_count_strength$interaction_strength[1],
+                                            barplot_linegraph_count_strength$interaction_strength[4:6]/barplot_linegraph_count_strength$interaction_strength[4])
+barplot_linegraph_count_strength$condition_timepoint_label=paste(barplot_linegraph_count_strength$condition,barplot_linegraph_count_strength$timepoint,sep='-')
+barplot_linegraph_count_strength$abbr <- c("U_03dpf","U_04dpf","U_05dpf","B_06hpb","B_24hpb","B_48hpb")
+
+ggplot(data = barplot_linegraph_count_strength,
+       aes(x = timepoint, y = interaction_count, fill = timepoint)) +
+  geom_segment(aes(x=timepoint, xend=timepoint, y=0, yend=interaction_count), color="skyblue") +
+  geom_point(aes(size = interaction_strength), color = "darkblue", alpha=0.8) +
+  facet_wrap(vars(condition)) +
+  theme_classic() +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1200))
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank(),
+    text = element_text(size = 8)
+  )
+ggsave("Plots/Fig4/Fig4A_Interaction_Count_Strength_barplt.svg",
+       width = 4, height = 1.6, dpi = 300)
+```
+
+```{r Fig. 4B Interaction count strength trends}
+# Fold-change linked scatterplots----
+ggplot(data=barplot_linegraph_count_strength,aes(x=timepoint,y=count_FC)) + 
+  geom_point(aes(color=condition), size = 2) + 
+  geom_line(aes(group=condition,color=condition), linewidth = 1) +
+  xlab('Timepoint') + ylab('Count Fold-Change (vs initial timepoint)') + 
+  ggtitle('Count Fold-Change over Time by Condition') +
+  theme_classic() +
+  theme(text = element_text(size = 8))
+ggsave("Plots/Fig4/Fig4B_Interaction_Count_FC_lineplt.svg",
+       width = 2.7, height = 1.6, dpi = 300)
+
+ggplot(data=barplot_linegraph_count_strength,aes(x=timepoint,y=strength_FC)) + 
+  geom_point(aes(color=condition),size = 2) + 
+  geom_line(aes(group=condition,color=condition), linewidth = 1) +
+  xlab('Timepoint') + ylab('Strength Fold-Change (vs initial timepoint)') + 
+  ggtitle('Strength Fold-Change over Time by Condition') +
+  theme_classic() +
+  theme(text = element_text(size = 8))
+ggsave("Plots/Fig4/Fig4B_Interaction_Strength_FC_lineplt.svg",
+       width = 2.7, height = 1.6, dpi = 300)
+```
+
+```{r Fig. 4C Signaling roles scatter}
+# Comparison of Signaling Roles Scatter----
+#Timepoint 1
+netAnalysis_diff_signalingRole_scatter(mergeCellChat(list(unwounded=cellchat_list$U_03dpf,burn=cellchat_list$B_06hpb), add.names = c('Unwounded','Burn')),
+                                       dot.size = 1.6, do.label = F) +
+  theme(text = element_text(size = 8))
+# ggsave("Plots/Fig4/Fig4C_SignalingRoleScatter_T1_legend.svg",
+#        width = 3, height = 3, dpi = 300)
+ggsave("Plots/Fig4/Fig4C_SignalingRoleScatter_T1.svg",
+       width = 1.6, height = 1.8, dpi = 300)
+
+#Timepoint 2
+netAnalysis_diff_signalingRole_scatter(mergeCellChat(list(unwounded=cellchat_list$U_04dpf,burn=cellchat_list$B_24hpb), add.names = c('Unwounded','Burn')),
+                                       dot.size = 1.6, do.label = F) +
+  theme(text = element_text(size = 8))
+ggsave("Plots/Fig4/Fig4C_SignalingRoleScatter_T2.svg",
+       width = 1.6, height = 1.8, dpi = 300)
+#Timepoint 3
+netAnalysis_diff_signalingRole_scatter(mergeCellChat(list(unwounded=cellchat_list$U_05dpf,burn=cellchat_list$B_48hpb), add.names = c('Unwounded','Burn')),
+                                       dot.size = 1.6, do.label = F) +
+  theme(text = element_text(size = 8))
+ggsave("Plots/Fig4/Fig4C_SignalingRoleScatter_T3.svg",
+       width = 1.6, height = 1.8, dpi = 300)
+```
+
+```{r Fig. 4D Information flow}
+# Information Flow Plots reversed order to match colors----
+#Timepoint 1
+timepoint1_stacked <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_03dpf,burn=cellchat_list$B_06hpb)),add.names = rev(c('Unwounded','Burn'))), mode = "comparison", 
+                              stacked = T, do.stat = TRUE)
+
+timepoint1_unstacked <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_03dpf,burn=cellchat_list$B_06hpb)),add.names = rev(c('Unwounded','Burn'))),mode = "comparison", 
+stacked = F, do.stat = T) +
+  theme(text = element_text(size = 8))
+timepoint1_unstacked
+ggsave("Plots/Fig4/Fig4D_Info_flow_unstacked_T1.svg",
+       width = 2.5, height = 3.6, dpi = 300)
+
+#Timepoint 2
+timepoint2_stacked <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_04dpf,burn=cellchat_list$B_24hpb)),add.names = rev(c('Unwounded','Burn'))), mode = "comparison", stacked = T, do.stat = TRUE)
+timepoint2_unstacked <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_04dpf,burn=cellchat_list$B_24hpb)),add.names = rev(c('Unwounded','Burn'))),mode = "comparison", stacked = F, do.stat = TRUE) +
+  theme(text = element_text(size = 8))
+timepoint2_unstacked
+ggsave("Plots/Fig4/Fig4D_Info_flow_unstacked_T2.svg",
+       width = 2.5, height = 3.6, dpi = 300)
+
+#Timepoint 3
+timepoint3_stacked <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_05dpf,burn=cellchat_list$B_48hpb)),add.names = rev(c('Unwounded','Burn'))), mode = "comparison", stacked = T, do.stat = TRUE)
+timepoint3_unstacked <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_05dpf,burn=cellchat_list$B_48hpb)),add.names = rev(c('Unwounded','Burn'))),mode = "comparison", stacked = F, do.stat = TRUE) +
+  theme(text = element_text(size = 8))
+timepoint3_unstacked
+ggsave("Plots/Fig4/Fig4D_Info_flow_unstacked_T3.svg",
+       width = 2.5, height = 3.6, dpi = 300)
+```
+
+```{r Fig. 4E Information flow - important for burn}
+# return names for venn plot
+t1.info <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_03dpf,burn=cellchat_list$B_06hpb)),add.names = rev(c('Unwounded','Burn'))),mode = "comparison", 
+stacked = F, do.stat = T, return.data = TRUE)
+t1.ligands <- unique(t1.info$signaling.contribution$name[t1.info$gg.obj$plot_env$colors.text == "#F8766D"])
+
+t2.info <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_04dpf,burn=cellchat_list$B_24hpb)),add.names = rev(c('Unwounded','Burn'))),mode = "comparison", stacked = F, do.stat = TRUE, return.data = TRUE)
+t2.ligands <- unique(t2.info$signaling.contribution$name[t2.info$gg.obj$plot_env$colors.text == "#F8766D"])
+
+t3.info <- rankNet(mergeCellChat(rev(list(unwounded=cellchat_list$U_05dpf,burn=cellchat_list$B_48hpb)),add.names = rev(c('Unwounded','Burn'))),mode = "comparison", stacked = F, do.stat = TRUE, return.data = TRUE)
+t3.ligands <- unique(t3.info$signaling.contribution$name[t3.info$gg.obj$plot_env$colors.text == "#F8766D"])
+# color code in gg.obj$plot_env$colors.text
+# ligands in signaling.contribution 
+
+time.col <- c("T1" = "#7FC97F","T2" = "#BEAED4","T3" = "#FDC086")
+venn.diagram(x = list(t1.ligands, t2.ligands, t3.ligands),
+             category.names = c("T1", "T2", "T3"),
+             filename = "Plots/Fig4/Fig4E_Info_flow_Burn_Ligands_Venn.svg",
+             imagetype = "svg",
+             height = 2,
+             width = 2,
+             resolution = 300,
+             cat.pos = c(-27, 27, 0),
+             cat.fontfamily = "sans",
+             cat.dist = 0.1,
+             col = time.col)
+```
+
+$T1
+[1] "GALECTIN" "PTN"      "CD39"     "IL16"     "RANKL"    "THY1"     "CD23"     "CXCL11"   "FN1"     
+
+$T2
+[1] "IGF"
+
+$T3
+[1] "CSF3" "IL12"
+
+$T1T2
+character(0)
+
+$T1T3
+[1] "IL6"    "NECTIN" "PVR"    "TIGIT" 
+
+$T2T3
+[1] "CNTN" "APP"  "LT"   "TNF"  "MPZ" 
+
+$T1T2T3
+[1] "CLEC"
+```{r Fig. 4F & Supp. Fig. 10 Network interaction}
+# Network interaction plots
+# Define a function for extracting interaction data and plot 
+plot_network_interaction_by_pathway <- function(object_list, pathway){
+  weight.max <- getMaxWeight(object_list, slot.name = c("netP"), attribute = pathway)
+  file.nm <- paste0("Plots/Fig4/Fig4F_NetworkInteraction_allTs_", pathway ,".svg")
+  svglite(filename = file.nm, width = 7, height = 5)
+  par(mfrow = c(2,3), xpd=TRUE)
+  for (i in 1:length(object_list)) {
+  netVisual_aggregate(object_list[[i]], signaling = pathway, vertex.label.cex = 0, 
+                      layout = "circle", edge.weight.max = weight.max[1], edge.width.max = 5, 
+                      signaling.name = paste(names(object_list)[i],pathway))
+  }
+  dev.off()
+}
+
+## IL6
+plot_network_interaction_by_pathway(object.list <- cellchat_list[-5], "IL6")
+## THY1
+plot_network_interaction_by_pathway(cellchat_list, "THY1")
+## JAM
+# plot_network_interaction_by_pathway("JAM")
+## IL16
+plot_network_interaction_by_pathway(cellchat_list, "IL16")
+## CLEC
+plot_network_interaction_by_pathway(cellchat_list, "CLEC")
+```
+
+## Figure 5
+```{r Fig. 5B microarray data preparation}
+#Burn microarray gene expression data and metadata
+GSE182616_matrix=as.matrix(read.table('Plots/Fig5/GSE182616.txt',sep = '\t',header = T))
+GSE182616_meta=read.table('Plots/Fig5/GSE182616-meta.txt',sep='\t',header=T)
+#neutrophil and macrophage DE gen dataframes with orthologs
+#Zebrafish human ortholog markers
+# Might need to separate the two major types (mac/neut) for marker calculation... right now, gpr84 is gone from the candidate list. 
+Idents(zfish_human_ortho) <- "CellType"
+ortho_neuts <- subset(zfish_human_ortho, idents = "Neutrophil")
+ortho_macs <- subset(zfish_human_ortho, idents = "Macrophage")
+
+Idents(ortho_neuts) <- "Identity"
+Idents(ortho_macs) <- "Identity"
+ortho_markers_neu <- FindAllMarkers(ortho_neuts,test.use = 'MAST',
+                                    logfc.threshold = 0.5, only.pos = T)
+
+ortho_markers_mac <- FindAllMarkers(ortho_macs,test.use = 'MAST',
+                                    logfc.threshold = 0.5, only.pos = T)
+
+ortho_markers_neu %>% 
+  filter(p_val_adj<0.01) %>% 
+  filter(gene %in% rownames(GSE182616_plot)) %>% 
+  group_by(cluster) %>% 
+  slice_max(n = 50,order_by = avg_log2FC) -> top50_ortho_neuts
+ortho_markers_mac %>% 
+  filter(p_val_adj<0.01) %>% 
+  filter(gene %in% rownames(GSE182616_plot)) %>% 
+  group_by(cluster) %>% 
+  slice_max(n = 50,order_by = avg_log2FC) -> top50_ortho_macs
+
+top_ortho_markers <- rbind(top50_ortho_macs, top50_ortho_neuts)
+
+#Process microarray metadata, add gene signatures and ligand-receptor interactions to microarray metadata for plotting ----
+tbsa_class=c()
+for (tbsa in GSE182616_meta$tbsa.ch1){
+  if (tbsa<10){
+    tbsa_class=c(tbsa_class,'Low TBSA')
+  } else if (tbsa<20){
+    tbsa_class=c(tbsa_class,'Medium TBSA')
+  } else if (tbsa<30){
+    tbsa_class=c(tbsa_class,'High TBSA')
+  } else {
+    tbsa_class=c(tbsa_class,'Very High TBSA')
+  }
+}
+
+GSE182616_meta$tbsa_classification=tbsa_class
+GSE182616_meta$tbsa_classification<-factor(GSE182616_meta$tbsa_classification,levels = c('Low TBSA','Medium TBSA','High TBSA','Very High TBSA'))
+GSE182616_plot=matrix(as.numeric(GSE182616_matrix[,2:dim(GSE182616_matrix)[2]]),ncol = 785)
+rownames(GSE182616_plot)=GSE182616_matrix[,1]
+colnames(GSE182616_plot)=colnames(GSE182616_matrix)[2:dim(GSE182616_matrix)[2]]
+
+GSE182616_meta$time.point.ch1<-(gsub(pattern = '_',replacement = '',GSE182616_meta$time.point.ch1))
+GSE182616_meta$time.point.ch1<-(gsub(pattern = ' ',replacement = '',GSE182616_meta$time.point.ch1))
+GSE182616_meta$time.point.ch1<-factor(GSE182616_meta$time.point.ch1,levels = c('hr0','hr2','hr4','hr8','hr12','hr24','hr36','hr48','hr60','hr72','hr84','hr96','hr108','hr120','hr132','hr144','hr156','hr168','D14','D21'))
+GSE182616_meta$patient=str_remove(str_before_first(GSE182616_meta$title,'\\.'),"^0+")
+GSE182616_meta<-GSE182616_meta%>%mutate(day_category=case_when(time.point.ch1 %in% c('hr0','hr2','hr4','hr8','hr12','hr24') ~ 'Day1',
+                                                               time.point.ch1 %in% c('hr36','hr48') ~ 'Day2',
+                                                               time.point.ch1 %in% c('hr60','hr72','hr84','hr96','hr108','hr120','hr132','hr144','hr156','hr168') ~ 'Day3-7',
+                                                               time.point.ch1 %in% c('D14') ~ 'Day14',
+                                                               time.point.ch1 %in% c('D21') ~ 'Day21'))
+
+# Extract expression from microarray
+acc_50=data.frame()
+for (i in 1:length(unique(top_ortho_markers$cluster))){
+  clusters <- as.character(unique(top_ortho_markers$cluster))
+  top_ortho_markers%>%filter(cluster==clusters[[i]])%>%dplyr::select(gene)->clust_test
+  if (ncol(acc_50)==0){
+    acc_50 <- data.frame(colMeans(GSE182616_plot[rownames(GSE182616_plot) %in% clust_test$gene,]))
+  } else {
+    acc_50 <- cbind(acc_50,data.frame(colMeans(GSE182616_plot[rownames(GSE182616_plot) %in% clust_test$gene,])))
+  }
+  colnames(acc_50)[i] <- clusters[[i]]
+}
+# add extraced expression to metadata
+GSE182616_meta <- cbind(GSE182616_meta,acc_50)
+```
+
+```{r Fig. 5B myeloid subset signature expression in human}
+my_comparisons <- list(c('Low TBSA','Very High TBSA'))
+# Define function for plotting each gene set
+geneset.expression.by.stage <- function(clusternm, comp.list){
+  plt.title <- paste0(clusternm, " Top50 Signatures")
+  plt.nm <- paste0("Plots/Fig5/Fig5B_human_ortholog_", 
+                   clusternm, 
+                   "_signatureExp_tbsa_classification_raincloud.svg")
+  plt <- ggplot(GSE182616_meta,aes(x=tbsa_classification,
+                                   y= .data[[clusternm]],
+                            fill=tbsa_classification))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .2, outlier.shape = NA) + 
+  geom_jitter(width = .05, alpha = .2, size = 0.1) +
+  ggtitle(plt.title
+          # , subtitle = paste('Spearman Correlation =',
+          #         round(cor(GSE182616_meta[[clusternm]],as.numeric(GSE182616_meta$tbsa_classification),
+          #         method = 'spearman'),digits = 3))
+          )+
+  xlab('') +
+  ylab("Average Expression") +
+  stat_compare_means(comparisons = comp.list, size = 2.5, ) +
+  theme(legend.position="none",panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        text = element_text(size = 8), axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1, size = 8),
+        axis.text.y =element_text(size = 8))
+  print(plt)
+ggsave(plt.nm, width = 2, height = 3.2, dpi = 300) 
+}
+
+for (clust in colnames(acc_50)){
+  geneset.expression.by.stage(clust, my_comparisons)
+}
+
+GSE182616_meta %>% 
+  group_by(tbsa_classification) %>% 
+  dplyr::summarise_at(vars(ccl34a.4_Macs:Mature_Neuts), mean, na.rm = TRUE)
+```
+
+```{r Fig. 5B myeloid subset signature expression in human - Day 1}
+## Day 1 only
+# Define function for plotting each gene set
+day1.data <- GSE182616_meta  %>%
+         filter(day_category=='Day1')
+geneset.expression.d1.by.stage <- function(clusternm, comp.list){
+  plt.title <- paste0(clusternm, " Top50 Signatures (Day 1)")
+  plt.nm <- paste0("Plots/Fig5/Fig5B_human_ortholog_", 
+                   clusternm, 
+                   "_signatureExp_Day1_only_tbsa_classification_raincloud.svg")
+  plt <- ggplot(day1.data, aes(x=tbsa_classification,
+                                   y= .data[[clusternm]],
+                            fill=tbsa_classification))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .2, outlier.shape = NA) + 
+  geom_jitter(width = .05, alpha = .2, size = 0.1) +
+  ggtitle(plt.title
+          # , subtitle = paste('Spearman Correlation =',
+          #         round(cor(day1.data[[clusternm]],as.numeric(day1.data[["tbsa_classification"]]),
+          #         method = 'spearman'),digits = 3))
+          )+
+  xlab('') +
+  ylab("Average Expression") +
+  stat_compare_means(comparisons = comp.list, size = 2.5) +
+  theme(legend.position="none",panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        text = element_text(size = 8), axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1, size = 8),
+        axis.text.y =element_text(size = 8))
+  print(plt)
+ggsave(plt.nm, width = 2, height = 2.2, dpi = 300) 
+}
+
+for (clust in colnames(acc_50)){
+  geneset.expression.d1.by.stage(clust, my_comparisons)
+}
+
+GSE182616_meta %>% filter(day_category=='Day1') %>% 
+  group_by(tbsa_classification) %>% 
+  dplyr::summarise_at(vars(ccl34a.4_Macs:Mature_Neuts), mean, na.rm = TRUE)
+```
+
+```{r Fig. 5B permutation test for Day 1}
+set.seed(101) ## for reproducibility
+nsim <- 10000
+mac_50_res <- matrix(0,nrow = 4,ncol=nsim) 
+neu_50_res <- matrix(0,nrow = 4,ncol=nsim)
+# use day1.data
+# input=GSE182616_meta[which(GSE182616_meta$time.point.ch1%in%c('hr0','hr2','hr4','hr8','hr12','hr24')),]
+tbsa_acc=c()
+for (i in 1:nsim) {
+  ## standard approach: scramble response value
+  perm <- sample(nrow(day1.data))
+  bdat <- transform(day1.data,tbsa_classification=tbsa_classification[perm])
+  mac_50_res[,i]<-c(mean(bdat$lgals3bpb_Mac1[bdat$tbsa_classification=='Very High TBSA']),
+                     mean(bdat$lgals3bpb_Mac1[bdat$tbsa_classification=='High TBSA']),
+                     mean(bdat$lgals3bpb_Mac1[bdat$tbsa_classification=='Medium TBSA']),
+                     mean(bdat$lgals3bpb_Mac1[bdat$tbsa_classification=='Low TBSA']))
+  neu_50_res[,i]<-c(mean(bdat$Immature_Neuts[bdat$tbsa_classification=='Very High TBSA']),
+                     mean(bdat$Immature_Neuts[bdat$tbsa_classification=='High TBSA']),
+                     mean(bdat$Immature_Neuts[bdat$tbsa_classification=='Medium TBSA']),
+                     mean(bdat$Immature_Neuts[bdat$tbsa_classification=='Low TBSA']))
+  tbsa_acc=c(tbsa_acc,bdat$tbsa_classification)
+}
+mac_50_df<-data_frame(cbind(as.numeric(c(mac_50_res[1,],mac_50_res[2,],mac_50_res[3,],mac_50_res[4,]))))
+colnames(mac_50_df)<-c('GeneSig_Score')
+mac_50_df$tbsa_classification=c(rep('Very High TBSA',10000),rep('High TBSA',10000),rep('Medium TBSA',10000),rep('Low TBSA',10000))
+mac_50_df$tbsa_classification=factor(mac_50_df$tbsa_classification,levels=c('Low TBSA','Medium TBSA','High TBSA','Very High TBSA'))
+
+neu_50_df<-data_frame(cbind(as.numeric(c(neu_50_res[1,],neu_50_res[2,],neu_50_res[3,],neu_50_res[4,]))))
+colnames(neu_50_df)<-c('GeneSig_Score')
+neu_50_df$tbsa_classification=c(rep('Very High TBSA',10000),rep('High TBSA',10000),rep('Medium TBSA',10000),rep('Low TBSA',10000))
+neu_50_df$tbsa_classification=factor(neu_50_df$tbsa_classification,levels=c('Low TBSA','Medium TBSA','High TBSA','Very High TBSA'))
+```
+
+```{r Fig. 5B - Permutation visualization}
+my_comparisons <- list( c('Low TBSA','Very High TBSA'))
+ggplot(neu_50_df,aes(x=tbsa_classification,y=GeneSig_Score,fill=tbsa_classification))+
+  ggtitle(paste('Permutation - Immature_Neuts Gene Signature'))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .2, outlier.shape = NA) + 
+  xlab("") +
+  ylab("Average Expression") + 
+  theme(legend.position="none",panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        text = element_text(size = 8), axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1, size = 8),
+        axis.text.y =element_text(size = 8),
+        title =element_text(size=8)) +
+  stat_compare_means(comparisons = my_comparisons, size = 2.5)
+ggsave('Plots/Fig5/Fig5B_GSE182616_ImmatureNeuts_50g_PermutationTest_day1.svg',
+       width = 2, height = 2.2, dpi = 300)
+
+ggplot(mac_50_df,aes(x=tbsa_classification,y=GeneSig_Score,fill=tbsa_classification))+
+  ggtitle(paste('Permutation - lgals3bpb_Mac1 Gene Signature'))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .2, outlier.shape = NA) + 
+  xlab("") +
+  ylab("Average Expression") + 
+  theme(legend.position="none",panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        text = element_text(size = 8), axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1, size = 8),
+        axis.text.y =element_text(size = 8),
+        title =element_text(size=8)) +
+  stat_compare_means(comparisons = my_comparisons, size = 2.5)
+ggsave('Plots/Fig5/Fig5B_GSE182616_lgals3bpb_Mac1_50g_PermutationTest_day1.svg',
+       width = 2, height = 2.2, dpi = 300)
+```
+
+```{r Fig. 5C - individual marker expression distribution}
+marker_plot<-cbind(GSE182616_meta,
+                   "GPR84" = GSE182616_plot['GPR84',], 
+                   "GYG1" = GSE182616_plot['GYG1',])
+
+ggplot(marker_plot, aes(x=GYG1, fill=tbsa_classification)) +
+  geom_density(alpha=0.5) + 
+  ggtitle('GYG1 Expression Density',
+          subtitle = paste('Spearman Correlation =',
+          round(cor(marker_plot[["GYG1"]],as.numeric(marker_plot[["tbsa_classification"]]),
+           method = 'spearman'),digits = 3))
+          )+
+  theme(text = element_text(size = 8), axis.text.x=element_text(size=8), axis.text.y = element_text(size=8))
+ggsave('Plots/Fig5/Fig5C_GSE182616_GYG1-marker_expression_distribution.svg',
+       width = 2.8, height = 1.6, dpi = 300)
+
+ggplot(marker_plot, aes(x=GPR84, fill=tbsa_classification)) +
+  geom_density(alpha=0.5) + 
+  ggtitle('GPR84 Expression Density',
+          subtitle = paste('Spearman Correlation =',
+          round(cor(marker_plot[["GPR84"]],as.numeric(marker_plot[["tbsa_classification"]]),
+           method = 'spearman'),digits = 3))
+          )+
+  theme(text = element_text(size = 8), axis.text.x=element_text(size=8),axis.text.y = element_text(size=8))
+ggsave('Plots/Fig5/Fig5C_GSE182616_GPR84-marker_expression_distribution.svg',
+       width = 2.8, height = 1.6, dpi = 300)
+```
+
+```{r Fig. 5E - GPR84+ neutrophil percentage in burn patients vs. healthy controls}
+gpr_84_freqs <- list(healthy = c(0.50, 1.78, 1.07, 0.51), burn = c(1.29, 3.29, 2.38, 1.76,5.12, 2.89))
+df <- data.frame(freqs = unlist(gpr_84_freqs),
+                 group = c(rep("healthy", length(gpr_84_freqs$healthy)), rep("burn", length(gpr_84_freqs$burn))))
+
+ggplot(df, aes(group, freqs)) + 
+  geom_boxplot() + 
+  geom_jitter(width = 0.2, size = 1, aes(color = group)) +
+  stat_compare_means(comparisons = list(c("burn","healthy")), method = "t.test") + 
+  xlab("Group") + 
+  ylab("Freqs of GPR84+ blood neutrophils") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        text = element_text(size = 8),
+        axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8))
+ggsave("Plots/Fig5/Fig5E_GPR84-neuts_frequency_whisker.svg", 
+       width = 2, height = 2.5)
+```
+
+# End
