@@ -589,7 +589,6 @@ ggsave(filename = "Plots/Fig1/Supp_Fig4B_zebrafish-to-human_id_match_UMAP.svg", 
 # convert adata to seurat format
 # Convert("zf_atlas_full_v4_release.h5ad", 
 #         dest = "h5seurat")
-# Z:/Lab Huttenlocher/1 Lab Data/Sequencing/ZebraHub/
 zf_atlas <- LoadH5Seurat("zf_atlas_full_v4_release.h5seurat", assay = "RNA")
 # visualize myeloid location
 Idents(zf_atlas) <- "timepoint"
@@ -2115,7 +2114,6 @@ GSE182616_matrix=as.matrix(read.table('Plots/Fig5/GSE182616.txt',sep = '\t',head
 GSE182616_meta=read.table('Plots/Fig5/GSE182616-meta.txt',sep='\t',header=T)
 #neutrophil and macrophage DE gen dataframes with orthologs
 #Zebrafish human ortholog markers
-# Might need to separate the two major types (mac/neut) for marker calculation... right now, gpr84 is gone from the candidate list. 
 Idents(zfish_human_ortho) <- "CellType"
 ortho_neuts <- subset(zfish_human_ortho, idents = "Neutrophil")
 ortho_macs <- subset(zfish_human_ortho, idents = "Macrophage")
